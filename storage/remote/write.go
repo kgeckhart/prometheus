@@ -53,6 +53,7 @@ var (
 		Name:      "histograms_in_total",
 		Help:      "HistogramSamples in to remote storage, compare to histograms out for queue managers.",
 	})
+	currentSegmentMetric prometheus.Gauge
 )
 
 // WriteStorage represents all the remote write storage.
@@ -74,6 +75,7 @@ type WriteStorage struct {
 
 	// For timestampTracker.
 	highestTimestamp *maxTimestamp
+	segmentTracker   *segmentTracker
 }
 
 // NewWriteStorage creates and runs a WriteStorage.
@@ -228,6 +230,9 @@ func (rws *WriteStorage) ApplyConfig(conf *config.Config) error {
 	}
 
 	rws.queues = newQueues
+	if rws.segmentTracker != nil {
+		rws.segmentTracker.updateQueues(rws.queues)
+	}
 
 	return nil
 }
@@ -269,6 +274,89 @@ func (rws *WriteStorage) Close() error {
 	}
 	close(rws.quit)
 	return nil
+}
+
+func (rws *WriteStorage) OnSegmentChange(f SegmentChangeFunc) {
+	rws.mtx.Lock()
+	defer rws.mtx.Unlock()
+
+	if rws.segmentTracker == nil {
+		rws.segmentTracker = newSegmentTracker(f, rws.queues)
+	} else {
+		rws.segmentTracker.updateChangeFunc(f)
+	}
+}
+
+// TODO test me.
+type segmentTracker struct {
+	mux                       sync.Mutex
+	currentSegment            int
+	queueHashToCurrentSegment map[string]int
+	onChange                  SegmentChangeFunc
+}
+
+func newSegmentTracker(onChange SegmentChangeFunc, queues map[string]*QueueManager) *segmentTracker {
+	st := &segmentTracker{
+		queueHashToCurrentSegment: make(map[string]int, len(queues)),
+		onChange:                  onChange,
+	}
+
+	currentSegmentMetric = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: subsystem,
+		Name:      "current_segment",
+		Help:      "Current segment being read by the remote write storage.",
+	})
+
+	for hash, q := range queues {
+		st.trackSegmentChangesForQueue(hash, q)
+	}
+
+	return st
+}
+
+func (st *segmentTracker) updateChangeFunc(f SegmentChangeFunc) {
+	st.mux.Lock()
+	defer st.mux.Unlock()
+	st.onChange = f
+}
+
+func (st *segmentTracker) updateQueues(newQueues map[string]*QueueManager) {
+	st.mux.Lock()
+	defer st.mux.Unlock()
+
+	updated := make(map[string]int, len(newQueues))
+	for hash, newQueue := range newQueues {
+		if existingQueue, ok := st.queueHashToCurrentSegment[hash]; ok {
+			updated[hash] = existingQueue
+		} else {
+			st.trackSegmentChangesForQueue(hash, newQueue)
+		}
+	}
+
+	st.queueHashToCurrentSegment = updated
+}
+
+func (st *segmentTracker) trackSegmentChangesForQueue(hash string, q *QueueManager) {
+	st.queueHashToCurrentSegment[hash] = -1
+
+	q.SetSegmentChangeFunc(func(currentSegment int) {
+		st.mux.Lock()
+		defer st.mux.Unlock()
+
+		// TODO should we move the current segment backwards we happen to have a if a new queue that starts on an older segment?
+		st.queueHashToCurrentSegment[hash] = currentSegment
+		for _, qCurrentSeg := range st.queueHashToCurrentSegment {
+			// A different queue is still behind, so there's no segment change to propagate
+			if qCurrentSeg < currentSegment {
+				return
+			}
+		}
+
+		st.currentSegment = currentSegment
+		currentSegmentMetric.Set(float64(currentSegment))
+		st.onChange(currentSegment)
+	})
 }
 
 type timestampTracker struct {

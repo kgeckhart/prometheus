@@ -443,6 +443,9 @@ type QueueManager struct {
 	metrics              *queueManagerMetrics
 	interner             *pool
 	highestRecvTimestamp *maxTimestamp
+
+	// segmentChangeFunc is called when a WAL segment changes
+	segmentChangeFunc SegmentChangeFunc
 }
 
 // NewQueueManager builds a new QueueManager and starts a new
@@ -519,7 +522,7 @@ func NewQueueManager(
 	if t.protoMsg != config.RemoteWriteProtoMsgV1 {
 		walMetadata = true
 	}
-	t.watcher = wlog.NewWatcher(watcherMetrics, readerMetrics, logger, client.Name(), t, dir, enableExemplarRemoteWrite, enableNativeHistogramRemoteWrite, walMetadata)
+	t.watcher = wlog.NewWatcher(watcherMetrics, readerMetrics, logger, client.Name(), t, dir, enableExemplarRemoteWrite, enableNativeHistogramRemoteWrite, walMetadata, t)
 
 	// The current MetadataWatcher implementation is mutually exclusive
 	// with the new approach, which stores metadata as WAL records and
@@ -1041,6 +1044,19 @@ func (t *QueueManager) client() WriteClient {
 	t.clientMtx.RLock()
 	defer t.clientMtx.RUnlock()
 	return t.storeClient
+}
+
+// OnSegmentChange implements the SegmentNotifier interface and is called when the WAL watcher changes segments.
+func (t *QueueManager) OnSegmentChange(currentSegment int) {
+	// TODO test me.
+	if t.segmentChangeFunc != nil {
+		t.segmentChangeFunc(currentSegment)
+	}
+}
+
+// SetSegmentChangeFunc sets the callback function to be called when a WAL segment changes.
+func (t *QueueManager) SetSegmentChangeFunc(f SegmentChangeFunc) {
+	t.segmentChangeFunc = f
 }
 
 // processExternalLabels merges externalLabels into b. If b contains

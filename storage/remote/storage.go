@@ -49,6 +49,8 @@ type ReadyScrapeManager interface {
 // startTimeCallback is a callback func that return the oldest timestamp stored in a storage.
 type startTimeCallback func() (int64, error)
 
+type SegmentChangeFunc func(currentSegment int)
+
 // Storage represents all the remote read and write endpoints.  It implements
 // storage.Storage.
 type Storage struct {
@@ -204,6 +206,10 @@ func (s *Storage) Close() error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 	return s.rws.Close()
+}
+
+func (s *Storage) OnSegmentChange(f SegmentChangeFunc) {
+	s.rws.OnSegmentChange(f)
 }
 
 func labelsToEqualityMatchers(ls model.LabelSet) []*labels.Matcher {

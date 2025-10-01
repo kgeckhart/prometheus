@@ -72,6 +72,14 @@ type WriteNotified interface {
 	Notify()
 }
 
+// SegmentNotifier is an interface for components that want to be notified about
+// the current WAL segment being read by the watcher.
+type SegmentNotifier interface {
+	// OnSegmentChange is called when the watcher changes to a new WAL segment.
+	// The currentSegment parameter indicates the segment number now being read.
+	OnSegmentChange(currentSegment int)
+}
+
 type WatcherMetrics struct {
 	recordsRead           *prometheus.CounterVec
 	recordDecodeFails     *prometheus.CounterVec
@@ -109,6 +117,9 @@ type Watcher struct {
 
 	// For testing, stop when we hit this segment.
 	MaxSegment int
+
+	// segmentNotifier is called when the watcher changes segments
+	segmentNotifier SegmentNotifier
 }
 
 func NewWatcherMetrics(reg prometheus.Registerer) *WatcherMetrics {
@@ -172,7 +183,7 @@ func NewWatcherMetrics(reg prometheus.Registerer) *WatcherMetrics {
 }
 
 // NewWatcher creates a new WAL watcher for a given WriteTo.
-func NewWatcher(metrics *WatcherMetrics, readerMetrics *LiveReaderMetrics, logger *slog.Logger, name string, writer WriteTo, dir string, sendExemplars, sendHistograms, sendMetadata bool) *Watcher {
+func NewWatcher(metrics *WatcherMetrics, readerMetrics *LiveReaderMetrics, logger *slog.Logger, name string, writer WriteTo, dir string, sendExemplars, sendHistograms, sendMetadata bool, notifier SegmentNotifier) *Watcher {
 	if logger == nil {
 		logger = promslog.NewNopLogger()
 	}
@@ -187,9 +198,10 @@ func NewWatcher(metrics *WatcherMetrics, readerMetrics *LiveReaderMetrics, logge
 		sendHistograms: sendHistograms,
 		sendMetadata:   sendMetadata,
 
-		readNotify: make(chan struct{}),
-		quit:       make(chan struct{}),
-		done:       make(chan struct{}),
+		segmentNotifier: notifier,
+		readNotify:      make(chan struct{}),
+		quit:            make(chan struct{}),
+		done:            make(chan struct{}),
 
 		MaxSegment: -1,
 	}
@@ -298,9 +310,15 @@ func (w *Watcher) Run() error {
 	for !isClosed(w.quit) {
 		w.currentSegmentMetric.Set(float64(currentSegment))
 
+		// TODO test me
+		// Notify about the current segment being processed
+		if w.segmentNotifier != nil {
+			w.segmentNotifier.OnSegmentChange(currentSegment)
+		}
 		// On start, after reading the existing WAL for series records, we have a pointer to what is the latest segment.
 		// On subsequent calls to this function, currentSegment will have been incremented and we should open that segment.
 		w.logger.Debug("Processing segment", "currentSegment", currentSegment)
+
 		if err := w.watch(currentSegment, currentSegment >= lastSegment); err != nil && !errors.Is(err, ErrIgnorable) {
 			return err
 		}
