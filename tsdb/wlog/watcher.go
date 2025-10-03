@@ -102,9 +102,10 @@ type Watcher struct {
 	readerMetrics  *LiveReaderMetrics
 
 	startTime               time.Time
-	startTimestamp          int64 // the start time as a Prometheus timestamp
+	startTimestamp          int64
 	sendingNewSamples       bool
 	sendSignalsDuringReplay bool
+	startSendingAt          int64
 
 	recordsReadMetric       *prometheus.CounterVec
 	recordDecodeFailsMetric prometheus.Counter
@@ -184,21 +185,33 @@ func NewWatcherMetrics(reg prometheus.Registerer) *WatcherMetrics {
 }
 
 // NewWatcher creates a new WAL watcher for a given WriteTo.
-func NewWatcher(metrics *WatcherMetrics, readerMetrics *LiveReaderMetrics, logger *slog.Logger, name string, writer WriteTo, dir string, sendExemplars, sendHistograms, sendMetadata bool, notifier SegmentNotifier, sendSignalsDuringReplay bool) *Watcher {
+// If startTimestamp is used to decide when to send samples. If the value is greater than the watcher start time the watcher
+// start time is used instead.
+func NewWatcher(
+	metrics *WatcherMetrics,
+	readerMetrics *LiveReaderMetrics,
+	logger *slog.Logger,
+	name string,
+	writer WriteTo,
+	dir string,
+	sendExemplars, sendHistograms, sendMetadata bool,
+	notifier SegmentNotifier,
+	startTimestamp int64,
+) *Watcher {
 	if logger == nil {
 		logger = promslog.NewNopLogger()
 	}
 	return &Watcher{
-		logger:                  logger,
-		writer:                  writer,
-		metrics:                 metrics,
-		readerMetrics:           readerMetrics,
-		walDir:                  filepath.Join(dir, "wal"),
-		name:                    name,
-		sendExemplars:           sendExemplars,
-		sendHistograms:          sendHistograms,
-		sendMetadata:            sendMetadata,
-		sendSignalsDuringReplay: sendSignalsDuringReplay,
+		logger:         logger,
+		writer:         writer,
+		metrics:        metrics,
+		readerMetrics:  readerMetrics,
+		walDir:         filepath.Join(dir, "wal"),
+		name:           name,
+		sendExemplars:  sendExemplars,
+		sendHistograms: sendHistograms,
+		sendMetadata:   sendMetadata,
+		startSendingAt: startTimestamp,
 
 		segmentNotifier: notifier,
 		readNotify:      make(chan struct{}),
@@ -263,7 +276,7 @@ func (w *Watcher) loop() {
 
 	// We may encounter failures processing the WAL; we should wait and retry.
 	for !isClosed(w.quit) {
-		w.SetStartTime(time.Now())
+		w.SetTimestamps(time.Now())
 		if err := w.Run(); err != nil {
 			w.logger.Error("error tailing WAL", "err", err)
 		}
@@ -609,7 +622,7 @@ func (w *Watcher) readSegment(r *LiveReader, segmentNum int, replaying bool) err
 			}
 			for _, fh := range floatHistograms {
 				newSample := fh.T > w.startTimestamp
-				if fh.T > w.startTimestamp || w.sendSignalsDuringReplay {
+				if newSample || w.sendSignalsDuringReplay {
 					if !w.sendingNewSamples && newSample {
 						w.sendingNewSamples = true
 						duration := time.Since(w.startTime)
@@ -682,9 +695,15 @@ func (w *Watcher) readSegmentForGC(r *LiveReader, segmentNum int, _ bool) error 
 	return nil
 }
 
-func (w *Watcher) SetStartTime(t time.Time) {
+func (w *Watcher) SetTimestamps(t time.Time) {
 	w.startTime = t
-	w.startTimestamp = timestamp.FromTime(t)
+	startTime := timestamp.FromTime(t)
+	if w.startSendingAt > startTime {
+		w.startSendingAt = startTime
+	} else {
+		w.sendSignalsDuringReplay = true
+		w.logger.Info("Sending samples during replay", "start_time", startTime, "start_sending_at", w.startSendingAt)
+	}
 }
 
 type segmentReadFn func(w *Watcher, r *LiveReader, segmentNum int, tail bool) error

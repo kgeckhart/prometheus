@@ -1282,6 +1282,9 @@ type RemoteWriteConfig struct {
 	// receiver as specified in https://prometheus.io/docs/specs/remote_write_spec_2_0/
 	ProtobufMessage RemoteWriteProtoMsg `yaml:"protobuf_message,omitempty"`
 
+	// ReplayUnsentData enables replaying unsent data on startup. If the config changes while running, no replay will be done.
+	ReplayUnsentData bool `yaml:"replay_unsent_data,omitempty"`
+
 	// We cannot do proper Go type embedding below as the parser will then parse
 	// values arbitrarily into the overflow maps of further-down types.
 	HTTPClientConfig config.HTTPClientConfig `yaml:",inline"`

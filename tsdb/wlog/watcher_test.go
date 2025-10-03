@@ -256,7 +256,7 @@ func TestTailSamples(t *testing.T) {
 
 			wt := newWriteToMock(0)
 			watcher := NewWatcher(wMetrics, nil, nil, "", wt, dir, true, true, true, nil)
-			watcher.SetStartTime(now)
+			watcher.SetTimestamps(now)
 
 			// Set the Watcher's metrics so they're not nil pointers.
 			watcher.SetMetrics()

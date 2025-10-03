@@ -18,6 +18,10 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -74,8 +78,10 @@ type WriteStorage struct {
 	quit              chan struct{}
 
 	// For timestampTracker.
-	highestTimestamp *maxTimestamp
-	segmentTracker   *segmentTracker
+	highestTimestamp           *maxTimestamp
+	segmentTracker             *segmentTracker
+	previouslyAppliedAConfig   bool
+	queuesForTimestampTracking []string
 }
 
 // NewWriteStorage creates and runs a WriteStorage.
@@ -112,12 +118,18 @@ func NewWriteStorage(logger *slog.Logger, reg prometheus.Registerer, dir string,
 }
 
 func (rws *WriteStorage) run() {
-	ticker := time.NewTicker(shardUpdateDuration)
-	defer ticker.Stop()
+	shardTicker := time.NewTicker(shardUpdateDuration)
+	defer shardTicker.Stop()
+
+	// TODO make this configurable and only track timestamps if at least one queue has ReplayUnsentData enabled.
+	queueTimestampTrackingTicker := time.NewTicker(time.Second)
+	defer queueTimestampTrackingTicker.Stop()
 	for {
 		select {
-		case <-ticker.C:
+		case <-shardTicker.C:
 			rws.samplesIn.tick()
+		case <-queueTimestampTrackingTicker.C:
+			rws.trackCurrentQueueTimestamps()
 		case <-rws.quit:
 			return
 		}
@@ -146,7 +158,13 @@ func (rws *WriteStorage) ApplyConfig(conf *config.Config) error {
 	rws.externalLabels = conf.GlobalConfig.ExternalLabels
 
 	newQueues := make(map[string]*QueueManager)
-	newHashes := []string{}
+	var newHashes []string
+	var queuesForTimestampTracking []string
+	var currentQueueTimestamps map[string]int64
+	if !rws.previouslyAppliedAConfig {
+		currentQueueTimestamps = rws.readCurrentQueueTimestamps()
+	}
+
 	for _, rwConf := range conf.RemoteWriteConfigs {
 		hash, err := toHash(rwConf)
 		if err != nil {
@@ -195,6 +213,13 @@ func (rws *WriteStorage) ApplyConfig(conf *config.Config) error {
 		// technically accepted but not recommended) since this is
 		// only used for metric labels.
 		endpoint := rwConf.URL.Redacted()
+		var replayFrom int64 = math.MaxInt64
+		if rwConf.ReplayUnsentData && !rws.previouslyAppliedAConfig && currentQueueTimestamps != nil {
+			if ts, ok := currentQueueTimestamps[hash]; ok {
+				replayFrom = ts
+			}
+		}
+
 		newQueues[hash] = NewQueueManager(
 			newQueueManagerMetrics(rws.reg, name, endpoint),
 			rws.watcherMetrics,
@@ -214,9 +239,13 @@ func (rws *WriteStorage) ApplyConfig(conf *config.Config) error {
 			rwConf.SendExemplars,
 			rwConf.SendNativeHistograms,
 			rwConf.ProtobufMessage,
+			replayFrom,
 		)
 		// Keep track of which queues are new so we know which to start.
 		newHashes = append(newHashes, hash)
+		if rwConf.ReplayUnsentData {
+			queuesForTimestampTracking = append(queuesForTimestampTracking, hash)
+		}
 	}
 
 	// Anything remaining in rws.queues is a queue who's config has
@@ -233,7 +262,10 @@ func (rws *WriteStorage) ApplyConfig(conf *config.Config) error {
 	if rws.segmentTracker != nil {
 		rws.segmentTracker.updateQueues(rws.queues)
 	}
-
+	rws.queuesForTimestampTracking = queuesForTimestampTracking
+	if !rws.previouslyAppliedAConfig {
+		rws.previouslyAppliedAConfig = true
+	}
 	return nil
 }
 
@@ -285,6 +317,74 @@ func (rws *WriteStorage) OnSegmentChange(f SegmentChangeFunc) {
 	} else {
 		rws.segmentTracker.updateChangeFunc(f)
 	}
+}
+
+type queueTimestamp struct {
+	hash string
+	ts   int64
+}
+
+const timestampFileName = "queue_timestamps"
+
+func (rws *WriteStorage) trackCurrentQueueTimestamps() {
+	rws.mtx.Lock()
+	defer rws.mtx.Unlock()
+
+	if len(rws.queuesForTimestampTracking) == 0 {
+		return
+	}
+
+	queueTimestamps := make([]queueTimestamp, 0, len(rws.queuesForTimestampTracking))
+	for _, q := range rws.queuesForTimestampTracking {
+		if qm, ok := rws.queues[q]; ok {
+			queueTimestamps = append(queueTimestamps, queueTimestamp{
+				hash: q,
+				ts:   int64(qm.metrics.highestSentTimestamp.Get() * 1000),
+			})
+		}
+	}
+
+	// Serialize queueTimestamps to a delimited string and write to a file at rws.dir.
+	var sb strings.Builder
+	for i, qt := range queueTimestamps {
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString(fmt.Sprintf("%s:%d", qt.hash, qt.ts))
+	}
+	filePath := filepath.Join(rws.dir, timestampFileName)
+	if err := os.WriteFile(filePath, []byte(sb.String()), 0644); err != nil {
+		rws.logger.Warn("failed to write queue timestamps to file", "file", filePath, "err", err)
+	}
+
+	rws.logger.Info("tracked current queue timestamps", "file", filePath, "queue_count", len(queueTimestamps))
+}
+
+func (rws *WriteStorage) readCurrentQueueTimestamps() map[string]int64 {
+	filePath := filepath.Join(rws.dir, timestampFileName)
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		rws.logger.Warn("failed to read queue timestamps file", "file", filePath, "err", err)
+		return nil
+	}
+
+	result := make(map[string]int64)
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		ts, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		result[parts[0]] = ts
+	}
+	return result
 }
 
 // TODO test me.
