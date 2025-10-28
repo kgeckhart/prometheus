@@ -84,7 +84,6 @@ type queueManagerMetrics struct {
 	enqueueRetriesTotal    prometheus.Counter
 	processBatchDuration   *prometheus.HistogramVec
 	sentBatchDuration      prometheus.Histogram
-	highestTimestamp       *maxTimestamp
 	highestSentTimestamp   *maxTimestamp
 	pendingSamples         prometheus.Gauge
 	pendingExemplars       prometheus.Gauge
@@ -242,21 +241,12 @@ func newQueueManagerMetrics(r prometheus.Registerer, rn, e string) *queueManager
 		NativeHistogramMaxBucketNumber:  100,
 		NativeHistogramMinResetDuration: 1 * time.Hour,
 	})
-	m.highestTimestamp = &maxTimestamp{
-		Gauge: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace:   namespace,
-			Subsystem:   subsystem,
-			Name:        "queue_highest_timestamp_seconds",
-			Help:        "Highest timestamp that was enqueued, in seconds since epoch. Initialized to 0 when no data has been received yet.",
-			ConstLabels: constLabels,
-		}),
-	}
 	m.highestSentTimestamp = &maxTimestamp{
 		Gauge: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace:   namespace,
 			Subsystem:   subsystem,
 			Name:        "queue_highest_sent_timestamp_seconds",
-			Help:        "Highest timestamp successfully sent by this queue, in seconds since epoch. Initialized to 0 when no data has been sent yet.",
+			Help:        "Timestamp from a WAL sample, the highest timestamp successfully sent by this queue, in seconds since epoch. Initialized to 0 when no data has been sent yet.",
 			ConstLabels: constLabels,
 		}),
 	}
@@ -362,7 +352,6 @@ func (m *queueManagerMetrics) register() {
 			m.enqueueRetriesTotal,
 			m.processBatchDuration,
 			m.sentBatchDuration,
-			m.highestTimestamp,
 			m.highestSentTimestamp,
 			m.pendingSamples,
 			m.pendingExemplars,
@@ -399,7 +388,6 @@ func (m *queueManagerMetrics) unregister() {
 		m.reg.Unregister(m.enqueueRetriesTotal)
 		m.reg.Unregister(m.processBatchDuration)
 		m.reg.Unregister(m.sentBatchDuration)
-		m.reg.Unregister(m.highestTimestamp)
 		m.reg.Unregister(m.highestSentTimestamp)
 		m.reg.Unregister(m.pendingSamples)
 		m.reg.Unregister(m.pendingExemplars)
@@ -467,10 +455,11 @@ type QueueManager struct {
 	quit        chan struct{}
 	wg          sync.WaitGroup
 
-	dataIn, dataOut, dataOutDuration *ewmaRate
+	dataIn, dataDropped, dataOut, dataOutDuration *ewmaRate
 
-	metrics  *queueManagerMetrics
-	interner *pool
+	metrics              *queueManagerMetrics
+	interner             *pool
+	highestRecvTimestamp *maxTimestamp
 }
 
 // NewQueueManager builds a new QueueManager and starts a new
@@ -484,6 +473,7 @@ func NewQueueManager(
 	readerMetrics *wlog.LiveReaderMetrics,
 	logger *slog.Logger,
 	dir string,
+	samplesIn *ewmaRate,
 	cfg config.QueueConfig,
 	mCfg config.MetadataConfig,
 	externalLabels labels.Labels,
@@ -491,6 +481,7 @@ func NewQueueManager(
 	client WriteClient,
 	flushDeadline time.Duration,
 	interner *pool,
+	highestRecvTimestamp *maxTimestamp,
 	sm ReadyScrapeManager,
 	enableExemplarRemoteWrite bool,
 	enableNativeHistogramRemoteWrite bool,
@@ -530,12 +521,14 @@ func NewQueueManager(
 		reshardChan: make(chan int),
 		quit:        make(chan struct{}),
 
-		dataIn:          newEWMARate(ewmaWeight, shardUpdateDuration),
+		dataIn:          samplesIn,
+		dataDropped:     newEWMARate(ewmaWeight, shardUpdateDuration),
 		dataOut:         newEWMARate(ewmaWeight, shardUpdateDuration),
 		dataOutDuration: newEWMARate(ewmaWeight, shardUpdateDuration),
 
-		metrics:  metrics,
-		interner: interner,
+		metrics:              metrics,
+		interner:             interner,
+		highestRecvTimestamp: highestRecvTimestamp,
 
 		protoMsg: protoMsg,
 		compr:    compression.Snappy, // Hardcoded for now, but scaffolding exists for likely future use.
@@ -725,6 +718,7 @@ outer:
 		t.seriesMtx.Lock()
 		lbls, ok := t.seriesLabels[s.Ref]
 		if !ok {
+			t.dataDropped.incr(1)
 			if _, ok := t.droppedSeries[s.Ref]; !ok {
 				t.logger.Info("Dropped sample for series that was not explicitly dropped via relabelling", "ref", s.Ref)
 				t.metrics.droppedSamplesTotal.WithLabelValues(reasonUnintentionalDroppedSeries).Inc()
@@ -786,6 +780,8 @@ outer:
 		t.seriesMtx.Lock()
 		lbls, ok := t.seriesLabels[e.Ref]
 		if !ok {
+			// Track dropped exemplars in the same EWMA for sharding calc.
+			t.dataDropped.incr(1)
 			if _, ok := t.droppedSeries[e.Ref]; !ok {
 				t.logger.Info("Dropped exemplar for series that was not explicitly dropped via relabelling", "ref", e.Ref)
 				t.metrics.droppedExemplarsTotal.WithLabelValues(reasonUnintentionalDroppedSeries).Inc()
@@ -847,6 +843,7 @@ outer:
 		t.seriesMtx.Lock()
 		lbls, ok := t.seriesLabels[h.Ref]
 		if !ok {
+			t.dataDropped.incr(1)
 			if _, ok := t.droppedSeries[h.Ref]; !ok {
 				t.logger.Info("Dropped histogram for series that was not explicitly dropped via relabelling", "ref", h.Ref)
 				t.metrics.droppedHistogramsTotal.WithLabelValues(reasonUnintentionalDroppedSeries).Inc()
@@ -907,6 +904,7 @@ outer:
 		t.seriesMtx.Lock()
 		lbls, ok := t.seriesLabels[h.Ref]
 		if !ok {
+			t.dataDropped.incr(1)
 			if _, ok := t.droppedSeries[h.Ref]; !ok {
 				t.logger.Info("Dropped histogram for series that was not explicitly dropped via relabelling", "ref", h.Ref)
 				t.metrics.droppedHistogramsTotal.WithLabelValues(reasonUnintentionalDroppedSeries).Inc()
@@ -1136,8 +1134,8 @@ func (t *QueueManager) shouldReshard(desiredShards int) bool {
 // outlined in this functions implementation. It is up to the caller to reshard, or not,
 // based on the return value.
 func (t *QueueManager) calculateDesiredShards() int {
-	t.dataIn.tick()
 	t.dataOut.tick()
+	t.dataDropped.tick()
 	t.dataOutDuration.tick()
 
 	// We use the number of incoming samples as a prediction of how much work we
@@ -1147,12 +1145,13 @@ func (t *QueueManager) calculateDesiredShards() int {
 	var (
 		dataInRate      = t.dataIn.rate()
 		dataOutRate     = t.dataOut.rate()
+		dataKeptRatio   = dataOutRate / (t.dataDropped.rate() + dataOutRate)
 		dataOutDuration = t.dataOutDuration.rate() / float64(time.Second)
-		dataPendingRate = dataInRate - dataOutRate
+		dataPendingRate = dataInRate*dataKeptRatio - dataOutRate
 		highestSent     = t.metrics.highestSentTimestamp.Get()
-		highestRecv     = t.metrics.highestTimestamp.Get()
+		highestRecv     = t.highestRecvTimestamp.Get()
 		delay           = highestRecv - highestSent
-		dataPending     = delay * dataInRate
+		dataPending     = delay * dataInRate * dataKeptRatio
 	)
 
 	if dataOutRate <= 0 {
@@ -1164,12 +1163,13 @@ func (t *QueueManager) calculateDesiredShards() int {
 		backlogCatchup = 0.05 * dataPending
 		// Calculate Time to send one sample, averaged across all sends done this tick.
 		timePerSample = dataOutDuration / dataOutRate
-		desiredShards = timePerSample * (dataInRate + backlogCatchup)
+		desiredShards = timePerSample * (dataInRate*dataKeptRatio + backlogCatchup)
 	)
 	t.metrics.desiredNumShards.Set(desiredShards)
 	t.logger.Debug("QueueManager.calculateDesiredShards",
 		"dataInRate", dataInRate,
 		"dataOutRate", dataOutRate,
+		"dataKeptRatio", dataKeptRatio,
 		"dataPendingRate", dataPendingRate,
 		"dataPending", dataPending,
 		"dataOutDuration", dataOutDuration,
@@ -1358,11 +1358,7 @@ func (s *shards) enqueue(ref chunks.HeadSeriesRef, data timeSeries) bool {
 		case tHistogram, tFloatHistogram:
 			s.qm.metrics.pendingHistograms.Inc()
 			s.enqueuedHistograms.Inc()
-		default:
-			return true
 		}
-		s.qm.metrics.highestTimestamp.Set(float64(data.timestamp / 1000))
-		s.qm.dataIn.incr(1)
 		return true
 	}
 }
