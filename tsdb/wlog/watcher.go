@@ -310,7 +310,6 @@ func (w *Watcher) Run() error {
 	for !isClosed(w.quit) {
 		w.currentSegmentMetric.Set(float64(currentSegment))
 
-		// TODO test me
 		// Notify about the current segment being processed
 		if w.segmentNotifier != nil {
 			w.segmentNotifier.OnSegmentChange(currentSegment)

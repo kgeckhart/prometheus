@@ -24,6 +24,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/promslog"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 
@@ -286,6 +287,14 @@ func TestTailSamples(t *testing.T) {
 	}
 }
 
+type testSegmentNotifier struct {
+	segmentsNotified []int
+}
+
+func (t *testSegmentNotifier) OnSegmentChange(currentSegment int) {
+	t.segmentsNotified = append(t.segmentsNotified, currentSegment)
+}
+
 func TestReadToEndNoCheckpoint(t *testing.T) {
 	pageSize := 32 * 1024
 	const seriesCount = 10
@@ -340,13 +349,15 @@ func TestReadToEndNoCheckpoint(t *testing.T) {
 			require.NoError(t, err)
 
 			wt := newWriteToMock(0)
-			watcher := NewWatcher(wMetrics, nil, nil, "", wt, dir, false, false, false, nil)
-			go watcher.Start()
+			sn := &testSegmentNotifier{}
+			watcher := NewWatcher(wMetrics, nil, nil, "", wt, dir, false, false, false, sn)
+			watcher.Start()
 
 			expected := seriesCount
-			require.Eventually(t, func() bool {
-				return wt.checkNumSeries() == expected
-			}, 20*time.Second, 1*time.Second)
+			require.EventuallyWithT(t, func(c *assert.CollectT) {
+				require.Equal(c, expected, wt.checkNumSeries())
+				require.Len(c, sn.segmentsNotified, 1, "We only had one segment, so should only have one notification")
+			}, 10*time.Second, 100*time.Millisecond)
 			watcher.Stop()
 		})
 	}
@@ -400,8 +411,9 @@ func TestReadToEndWithCheckpoint(t *testing.T) {
 				}
 			}
 
-			Checkpoint(promslog.NewNopLogger(), w, 0, 1, func(_ chunks.HeadSeriesRef, _ int) bool { return true }, 0)
-			w.Truncate(1)
+			_, err = Checkpoint(promslog.NewNopLogger(), w, 0, 1, func(_ chunks.HeadSeriesRef, _ int) bool { return true }, 0)
+			require.NoError(t, err)
+			require.NoError(t, w.Truncate(1))
 
 			// Write more records after checkpointing.
 			for i := 0; i < seriesCount; i++ {
@@ -425,21 +437,55 @@ func TestReadToEndWithCheckpoint(t *testing.T) {
 				}
 			}
 
-			_, _, err = Segments(w.Dir())
+			first, last, err := Segments(w.Dir())
 			require.NoError(t, err)
 			overwriteReadTimeout(t, time.Second)
 			wt := newWriteToMock(0)
-			watcher := NewWatcher(wMetrics, nil, nil, "", wt, dir, false, false, false, nil)
-			go watcher.Start()
+			sn := &testSegmentNotifier{}
+			watcher := NewWatcher(wMetrics, nil, nil, "", wt, dir, false, false, false, sn)
+			watcher.Start()
 
 			expected := seriesCount * 2
 
-			require.Eventually(t, func() bool {
-				return wt.checkNumSeries() == expected
-			}, 10*time.Second, 1*time.Second)
+			require.EventuallyWithT(t, func(c *assert.CollectT) {
+				require.Equal(c, expected, wt.checkNumSeries())
+				require.Len(c, sn.segmentsNotified, last-first+1)
+			}, 10*time.Second, 100*time.Millisecond)
 			watcher.Stop()
 		})
 	}
+}
+
+func TestWillNotifyManySegments(t *testing.T) {
+	segmentSize := 32 * 1024
+	dir := t.TempDir()
+
+	wdir := path.Join(dir, "wal")
+	err := os.Mkdir(wdir, 0o777)
+	require.NoError(t, err)
+
+	w, err := NewSize(nil, nil, wdir, segmentSize, compression.None)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, w.Close())
+	}()
+
+	for range 9 {
+		_, err = w.NextSegment()
+		require.NoError(t, err)
+	}
+
+	require.NoError(t, err)
+	overwriteReadTimeout(t, time.Second)
+	wt := newWriteToMock(0)
+	sn := &testSegmentNotifier{}
+	watcher := NewWatcher(wMetrics, nil, nil, "", wt, dir, false, false, false, sn)
+	watcher.Start()
+
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		require.Len(c, sn.segmentsNotified, 10, "We should have notified of 10 segments")
+	}, 10*time.Second, 100*time.Millisecond)
+	watcher.Stop()
 }
 
 func TestReadCheckpoint(t *testing.T) {

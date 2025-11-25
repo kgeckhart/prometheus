@@ -343,8 +343,7 @@ func (st *segmentTracker) trackSegmentChangesForQueue(hash string, q *QueueManag
 	q.SetSegmentChangeFunc(func(currentSegment int) {
 		st.mux.Lock()
 		defer st.mux.Unlock()
-
-		// TODO should we move the current segment backwards we happen to have a if a new queue that starts on an older segment?
+		
 		st.queueHashToCurrentSegment[hash] = currentSegment
 		for _, qCurrentSeg := range st.queueHashToCurrentSegment {
 			// A different queue is still behind, so there's no segment change to propagate

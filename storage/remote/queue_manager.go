@@ -1048,7 +1048,6 @@ func (t *QueueManager) client() WriteClient {
 
 // OnSegmentChange implements the SegmentNotifier interface and is called when the WAL watcher changes segments.
 func (t *QueueManager) OnSegmentChange(currentSegment int) {
-	// TODO test me.
 	if t.segmentChangeFunc != nil {
 		t.segmentChangeFunc(currentSegment)
 	}
