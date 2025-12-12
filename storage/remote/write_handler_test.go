@@ -50,9 +50,10 @@ func TestRemoteWriteHandlerHeadersHandling_V1Message(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, tc := range []struct {
-		name         string
-		reqHeaders   map[string]string
-		expectedCode int
+		name                    string
+		reqHeaders              map[string]string
+		expectedCode            int
+		extraResponseAssertions func(*testing.T, *http.Response)
 	}{
 		// Generally Prometheus 1.0 Receiver never checked for existence of the headers, so
 		// we keep things permissive.
@@ -64,6 +65,15 @@ func TestRemoteWriteHandlerHeadersHandling_V1Message(t *testing.T) {
 				RemoteWriteVersionHeader: RemoteWriteVersion20HeaderValue,
 			},
 			expectedCode: http.StatusNoContent,
+			extraResponseAssertions: func(t *testing.T, resp *http.Response) {
+				samplesHeader := resp.Header.Get(rw20WrittenSamplesHeader)
+				exemplarsHeader := resp.Header.Get(rw20WrittenExemplarsHeader)
+				histogramsHeader := resp.Header.Get(rw20WrittenHistogramsHeader)
+
+				require.Empty(t, samplesHeader, "Prometheus 1.0 remote write should not return samples written header")
+				require.Empty(t, exemplarsHeader, "Prometheus 1.0 remote write should not return exemplars written header")
+				require.Empty(t, histogramsHeader, "Prometheus 1.0 remote write should not return histograms written header")
+			},
 		},
 		{
 			name: "missing remote write version",
@@ -140,6 +150,9 @@ func TestRemoteWriteHandlerHeadersHandling_V1Message(t *testing.T) {
 			require.NoError(t, err)
 			_ = resp.Body.Close()
 			require.Equal(t, tc.expectedCode, resp.StatusCode, string(out))
+			if tc.extraResponseAssertions != nil {
+				tc.extraResponseAssertions(t, resp)
+			}
 		})
 	}
 }
