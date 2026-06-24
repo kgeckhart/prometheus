@@ -382,9 +382,7 @@ func TestWALMetadataDelivery(t *testing.T) {
 	qm.StoreSeries(recs.Series, 0)
 	qm.StoreMetadata(recs.Metadata)
 
-	qm.series.lock()
-	require.Equal(t, n, qm.series.activeLen())
-	qm.series.unlock()
+	require.Equal(t, n, qm.series.ActiveLen())
 
 	c.expectSamples(recs.Samples, recs.Series)
 	c.expectMetadataForBatch(recs.Metadata, recs.Series, recs.Samples, nil, nil, nil)
@@ -492,148 +490,132 @@ func TestSeriesStorage(t *testing.T) {
 	lbls1 := labels.FromStrings("__name__", "metric_one")
 	lbls1Updated := labels.FromStrings("__name__", "metric_one_v2")
 
+	// Relabel stubs: identity keeps the labels untouched; dropAll rejects the
+	// series without mutating.
+	identity := func(l labels.Labels) (labels.Labels, bool) { return l, true }
+	dropAll := func(labels.Labels) (labels.Labels, bool) { return labels.EmptyLabels(), false }
+
+	// store adds ref with lbls at segment 0 via the public update API.
+	store := func(s *SeriesStorage, ref chunks.HeadSeriesRef, lbls labels.Labels) {
+		s.Update([]record.RefSeries{{Ref: ref, Labels: lbls}}, 0, identity)
+	}
+	// drop marks ref as dropped at segment 0 via the public update API.
+	drop := func(s *SeriesStorage, ref chunks.HeadSeriesRef, lbls labels.Labels) {
+		s.Update([]record.RefSeries{{Ref: ref, Labels: lbls}}, 0, dropAll)
+	}
+
 	t.Run("withMeta=false", func(t *testing.T) {
-		s := &seriesStorage{
-			withMeta: false,
-			labels:   make(map[chunks.HeadSeriesRef]labels.Labels),
-			dropped:  make(map[chunks.HeadSeriesRef]struct{}),
-		}
+		s := NewSeriesStorage(false)
 
 		// Never-seen ref: not active, not dropped.
-		lbls, meta, active, dropped := s.lookup(ref1)
+		lbls, meta, active, dropped := s.Lookup(ref1)
 		require.Equal(t, labels.EmptyLabels(), lbls)
 		require.Nil(t, meta)
 		require.False(t, active)
 		require.False(t, dropped)
 
 		// Store and look up an active series.
-		s.lock()
-		s.storeLocked(ref1, lbls1)
-		require.Equal(t, 1, s.activeLen())
-		s.unlock()
+		store(s, ref1, lbls1)
+		require.Equal(t, 1, s.ActiveLen())
 
-		lbls, meta, active, dropped = s.lookup(ref1)
+		lbls, meta, active, dropped = s.Lookup(ref1)
 		require.Equal(t, lbls1, lbls)
 		require.Nil(t, meta) // metadata always nil when withMeta=false
 		require.True(t, active)
 		require.False(t, dropped)
 
-		// storeMetadataLocked is a no-op for withMeta=false.
-		s.lock()
-		s.storeMetadataLocked(ref1, record.RefMetadata{Ref: ref1, Type: 1, Unit: "bytes", Help: "help"})
-		s.unlock()
-		_, meta, _, _ = s.lookup(ref1)
+		// updateMetadata is a no-op for withMeta=false.
+		s.UpdateMetadata([]record.RefMetadata{{Ref: ref1, Type: 1, Unit: "bytes", Help: "help"}})
+		_, meta, _, _ = s.Lookup(ref1)
 		require.Nil(t, meta)
 
 		// Drop the series: active=false, dropped=true.
-		s.lock()
-		s.dropLocked(ref1)
-		require.Equal(t, 0, s.activeLen())
-		s.unlock()
+		drop(s, ref1, lbls1)
+		require.Equal(t, 0, s.ActiveLen())
 
-		lbls, meta, active, dropped = s.lookup(ref1)
+		lbls, meta, active, dropped = s.Lookup(ref1)
 		require.Equal(t, labels.EmptyLabels(), lbls)
 		require.Nil(t, meta)
 		require.False(t, active)
 		require.True(t, dropped)
 
-		// deleteLocked removes all traces: subsequent lookup is never-seen.
-		s.lock()
-		s.deleteLocked(ref1)
-		s.unlock()
-
-		_, _, active, dropped = s.lookup(ref1)
+		// reset with beforeIndex=1 purges the series tagged at segment 0,
+		// restoring the never-seen state.
+		s.Reset(1)
+		_, _, active, dropped = s.Lookup(ref1)
 		require.False(t, active)
 		require.False(t, dropped)
 	})
 
 	t.Run("withMeta=true", func(t *testing.T) {
-		s := &seriesStorage{
-			withMeta: true,
-			entries:  make(map[chunks.HeadSeriesRef]seriesEntry),
-			dropped:  make(map[chunks.HeadSeriesRef]struct{}),
-		}
+		s := NewSeriesStorage(true)
 
 		// Never-seen ref: not active, not dropped.
-		lbls, meta, active, dropped := s.lookup(ref1)
+		lbls, meta, active, dropped := s.Lookup(ref1)
 		require.Equal(t, labels.EmptyLabels(), lbls)
 		require.Nil(t, meta)
 		require.False(t, active)
 		require.False(t, dropped)
 
 		// Store series; metadata is nil until explicitly set.
-		s.lock()
-		s.storeLocked(ref1, lbls1)
-		require.Equal(t, 1, s.activeLen())
-		s.unlock()
+		store(s, ref1, lbls1)
+		require.Equal(t, 1, s.ActiveLen())
 
-		lbls, meta, active, dropped = s.lookup(ref1)
+		lbls, meta, active, dropped = s.Lookup(ref1)
 		require.Equal(t, lbls1, lbls)
 		require.Nil(t, meta)
 		require.True(t, active)
 		require.False(t, dropped)
 
 		// Store metadata; labels must be unchanged.
-		s.lock()
-		s.storeMetadataLocked(ref1, record.RefMetadata{Ref: ref1, Type: 1, Unit: "bytes", Help: "help"})
-		s.unlock()
+		s.UpdateMetadata([]record.RefMetadata{{Ref: ref1, Type: 1, Unit: "bytes", Help: "help"}})
 
-		lbls, meta, active, _ = s.lookup(ref1)
+		lbls, meta, active, _ = s.Lookup(ref1)
 		require.Equal(t, lbls1, lbls)
 		require.NotNil(t, meta)
 		require.Equal(t, "bytes", meta.Unit)
 		require.True(t, active)
 
-		// Update labels via storeLocked; existing metadata must be preserved.
-		s.lock()
-		s.storeLocked(ref1, lbls1Updated)
-		s.unlock()
+		// Re-store with updated labels; existing metadata must be preserved.
+		store(s, ref1, lbls1Updated)
 
-		lbls, meta, active, _ = s.lookup(ref1)
+		lbls, meta, active, _ = s.Lookup(ref1)
 		require.Equal(t, lbls1Updated, lbls)
-		require.NotNil(t, meta, "storeLocked must preserve existing metadata")
+		require.NotNil(t, meta, "update must preserve existing metadata")
 		require.Equal(t, "bytes", meta.Unit)
 		require.True(t, active)
 
-		// storeMetadataLocked must not create an entry for a never-seen series.
-		s.lock()
-		s.storeMetadataLocked(ref3, record.RefMetadata{Ref: ref3, Type: 1, Unit: "u", Help: "h"})
-		require.Equal(t, 1, s.activeLen())
-		s.unlock()
-		_, _, active, _ = s.lookup(ref3)
+		// updateMetadata must not create an entry for a never-seen series.
+		s.UpdateMetadata([]record.RefMetadata{{Ref: ref3, Type: 1, Unit: "u", Help: "h"}})
+		require.Equal(t, 1, s.ActiveLen())
+		_, _, active, _ = s.Lookup(ref3)
 		require.False(t, active)
 
 		// Drop the series: labels and metadata no longer accessible.
-		s.lock()
-		s.dropLocked(ref1)
-		require.Equal(t, 0, s.activeLen())
-		s.unlock()
+		drop(s, ref1, lbls1)
+		require.Equal(t, 0, s.ActiveLen())
 
-		lbls, meta, active, dropped = s.lookup(ref1)
+		lbls, meta, active, dropped = s.Lookup(ref1)
 		require.Equal(t, labels.EmptyLabels(), lbls)
 		require.Nil(t, meta)
 		require.False(t, active)
 		require.True(t, dropped)
 
-		// storeLocked on a previously-dropped ref restores it as active.
-		s.lock()
-		s.storeLocked(ref1, lbls1)
-		s.unlock()
+		// update on a previously-dropped ref restores it as active.
+		store(s, ref1, lbls1)
 
-		_, _, active, dropped = s.lookup(ref1)
+		_, _, active, dropped = s.Lookup(ref1)
 		require.True(t, active)
 		require.False(t, dropped)
 
-		// deleteLocked removes both the active entry and the dropped flag.
-		s.lock()
-		s.storeLocked(ref2, labels.FromStrings("__name__", "metric_two"))
-		s.dropLocked(ref1) // move ref1 back to dropped before deleting
-		s.deleteLocked(ref1)
-		s.deleteLocked(ref2)
-		require.Equal(t, 0, s.activeLen())
-		s.unlock()
+		// reset purges both active and dropped entries for refs whose segment
+		// is older than beforeIndex.
+		store(s, ref2, labels.FromStrings("__name__", "metric_two"))
+		drop(s, ref1, lbls1) // move ref1 back to dropped before reset
+		s.Reset(1)
+		require.Equal(t, 0, s.ActiveLen())
 
-		_, _, active, dropped = s.lookup(ref1)
+		_, _, active, dropped = s.Lookup(ref1)
 		require.False(t, active)
 		require.False(t, dropped)
 	})
@@ -661,14 +643,10 @@ func TestSeriesReset(t *testing.T) {
 				m.StoreSeries(series, i)
 				m.StoreMetadata(metadata)
 			}
-			m.series.lock()
-			require.Equal(t, numSegments*numSeries, m.series.activeLen())
-			m.series.unlock()
+			require.Equal(t, numSegments*numSeries, m.series.ActiveLen())
 
 			m.SeriesReset(2)
-			m.series.lock()
-			require.Equal(t, numSegments*numSeries/2, m.series.activeLen())
-			m.series.unlock()
+			require.Equal(t, numSegments*numSeries/2, m.series.ActiveLen())
 		})
 	}
 }
