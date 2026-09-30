@@ -78,6 +78,11 @@ type Options struct {
 	// deleted.
 	MinWALTime, MaxWALTime int64
 
+	// TruncateReadSegments makes WAL truncation remove every segment all remote
+	// write queues have read, instead of the lower two-thirds. When MaxWALTime
+	// caps the truncation point, the two-thirds rule still applies.
+	TruncateReadSegments bool
+
 	// NoLockfile disables creation and consideration of a lock file.
 	NoLockfile bool
 
@@ -284,6 +289,9 @@ type DB struct {
 
 	writeNotified wlog.WriteNotified
 
+	// lowestReadSegment is rs.LowestReadSegment, replaceable in tests.
+	lowestReadSegment func() int
+
 	metrics *dbMetrics
 }
 
@@ -326,6 +334,7 @@ func Open(l *slog.Logger, reg prometheus.Registerer, rs *remote.Storage, dir str
 
 		metrics: newDBMetrics(reg),
 	}
+	db.lowestReadSegment = rs.LowestReadSegment
 
 	db.bufPool.New = func() any {
 		return make([]byte, 0, 1024)
@@ -708,12 +717,14 @@ Loop:
 			// changing. We don't want data in the WAL to grow forever, so we set a cap
 			// on the maximum age data can be. If our ts is older than this cutoff point,
 			// we'll shift it forward to start deleting very stale data.
+			capped := false
 			if maxTS := timestamp.FromTime(time.Now()) - db.opts.MaxWALTime; ts < maxTS {
 				ts = maxTS
+				capped = true
 			}
 
 			db.logger.Debug("truncating the WAL", "ts", ts)
-			if err := db.truncate(ts); err != nil {
+			if err := db.truncateAt(ts, capped); err != nil {
 				db.logger.Warn("failed to truncate WAL", "err", err)
 			}
 		}
@@ -737,6 +748,14 @@ func (db *DB) keepSeriesInWALCheckpointFn(last int) func(id chunks.HeadSeriesRef
 }
 
 func (db *DB) truncate(mint int64) error {
+	return db.truncateAt(mint, false)
+}
+
+// truncateAt GCs series older than mint and truncates the WAL. With
+// TruncateReadSegments, it removes every segment all remote write queues have
+// read, unless the max-time cap set mint (unreadAllowed), which falls back to
+// the lower two-thirds whether read or not.
+func (db *DB) truncateAt(mint int64, unreadAllowed bool) error {
 	db.logger.Info("series GC started")
 	db.mtx.RLock()
 	defer db.mtx.RUnlock()
@@ -762,11 +781,19 @@ func (db *DB) truncate(mint int64) error {
 		return nil // no segments yet
 	}
 
-	// The lower two-thirds of segments should contain mostly obsolete samples.
-	// If we have less than two segments, it's not worth checkpointing yet.
-	last = first + (last-first)*2/3
-	if last <= first {
-		return nil
+	if db.opts.TruncateReadSegments && !unreadAllowed {
+		// Every queue has read these segments, so nothing in them is still to be sent.
+		last = min(last, db.lowestReadSegment())
+		if last < first {
+			return nil
+		}
+	} else {
+		// The lower two-thirds of segments should contain mostly obsolete samples.
+		// If we have less than two segments, it's not worth checkpointing yet.
+		last = first + (last-first)*2/3
+		if last <= first {
+			return nil
+		}
 	}
 
 	db.metrics.checkpointCreationTotal.Inc()

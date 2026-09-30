@@ -583,6 +583,10 @@ func main() {
 		"Maximum age samples may be before being forcibly deleted when the WAL is truncated").
 		Default(agentDefaultMaxWALTime).SetValue(&cfg.agent.MaxWALTime)
 
+	agentOnlyFlag(a, "storage.agent.truncate-read-segments",
+		"On WAL truncation, remove every segment all remote write queues have read, instead of the lower two-thirds. When --storage.agent.retention.max-time caps truncation, the two-thirds rule still applies.").
+		Default("false").BoolVar(&cfg.agent.TruncateReadSegments)
+
 	agentOnlyFlag(a, "storage.agent.checkpoint-from-in-memory-series", "Use only in-memory series data when building a checkpoint.").
 		Default("false").BoolVar(&cfg.agent.CheckpointFromInMemorySeries)
 
@@ -1587,6 +1591,7 @@ func main() {
 					"TruncateFrequency", cfg.agent.TruncateFrequency,
 					"MinWALTime", cfg.agent.MinWALTime,
 					"MaxWALTime", cfg.agent.MaxWALTime,
+					"TruncateReadSegments", cfg.agent.TruncateReadSegments,
 					"OutOfOrderTimeWindow", cfg.agent.OutOfOrderTimeWindow,
 					"EnableSTAsZeroSample", cfg.agent.EnableSTAsZeroSample,
 					"EnableSTStorage", cfg.tsdb.EnableSTStorage,
@@ -2195,6 +2200,7 @@ type agentOptions struct {
 	StripeSize                   int
 	TruncateFrequency            model.Duration
 	MinWALTime, MaxWALTime       model.Duration
+	TruncateReadSegments         bool
 	NoLockfile                   bool
 	OutOfOrderTimeWindow         int64 // TODO(bwplotka): Unused option, fix it or remove.
 	EnableSTAsZeroSample         bool
@@ -2214,6 +2220,7 @@ func (opts agentOptions) ToAgentOptions(outOfOrderTimeWindow int64) agent.Option
 		TruncateFrequency:            time.Duration(opts.TruncateFrequency),
 		MinWALTime:                   durationToInt64Millis(time.Duration(opts.MinWALTime)),
 		MaxWALTime:                   durationToInt64Millis(time.Duration(opts.MaxWALTime)),
+		TruncateReadSegments:         opts.TruncateReadSegments,
 		NoLockfile:                   opts.NoLockfile,
 		OutOfOrderTimeWindow:         outOfOrderTimeWindow,
 		EnableSTAsZeroSample:         opts.EnableSTAsZeroSample,

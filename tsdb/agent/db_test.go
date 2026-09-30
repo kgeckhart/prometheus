@@ -1525,6 +1525,50 @@ func TestDuplicateSeriesRefsByHash(t *testing.T) {
 	}
 }
 
+func TestTruncateReadSegments(t *testing.T) {
+	cases := []struct {
+		name          string
+		enabled       bool
+		closed        int // Closed segments before truncation, plus the one truncate closes.
+		lowestRead    int
+		unreadAllowed bool
+		wantFirst     int // First segment left after truncation.
+	}{
+		{name: "off, two-thirds rule", closed: 3, lowestRead: -1, wantFirst: 2},
+		{name: "off, two closed segments truncate nothing", closed: 2, lowestRead: -1, wantFirst: 0},
+		{name: "healthy reader removes everything read", enabled: true, closed: 3, lowestRead: 2, wantFirst: 3},
+		{name: "healthy reader with two closed segments", enabled: true, closed: 2, lowestRead: 1, wantFirst: 2},
+		{name: "no queues", enabled: true, closed: 3, lowestRead: math.MaxInt, wantFirst: 3},
+		{name: "lagging reader keeps what the two-thirds rule would cut", enabled: true, closed: 3, lowestRead: 0, wantFirst: 1},
+		{name: "reader still on the checkpoint", enabled: true, closed: 3, lowestRead: -1, wantFirst: 0},
+		{name: "max-time cap truncates unread segments", enabled: true, closed: 3, lowestRead: -1, unreadAllowed: true, wantFirst: 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := DefaultOptions()
+			opts.TruncateReadSegments = tc.enabled
+			db := createTestAgentDB(t, nil, opts)
+			defer func() { require.NoError(t, db.Close()) }()
+			db.lowestReadSegment = func() int { return tc.lowestRead }
+
+			app := db.Appender(context.Background())
+			_, err := app.Append(0, labels.FromStrings("__name__", "m"), 100, 1)
+			require.NoError(t, err)
+			require.NoError(t, app.Commit())
+			// Segment tc.closed is the active one, which truncation closes and never removes.
+			for range tc.closed {
+				_, err := db.wal.NextSegmentSync()
+				require.NoError(t, err)
+			}
+
+			require.NoError(t, db.truncateAt(0, tc.unreadAllowed))
+			first, _, err := wlog.Segments(db.wal.Dir())
+			require.NoError(t, err)
+			require.Equal(t, tc.wantFirst, first)
+		})
+	}
+}
+
 func readWALSamples(t *testing.T, walDir string) []walSample {
 	t.Helper()
 	sr, err := wlog.NewSegmentsReader(walDir)
