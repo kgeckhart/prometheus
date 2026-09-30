@@ -112,6 +112,7 @@ type Watcher struct {
 	startTime      time.Time
 	startTimestamp int64 // the start time as a Prometheus timestamp
 	sendSamples    bool
+	segmented      bool // Set by runSegmented; there are no checkpoints to GC from.
 
 	recordsReadMetric       *prometheus.CounterVec
 	recordDecodeFailsMetric prometheus.Counter
@@ -372,6 +373,7 @@ func (w *Watcher) runSegmented(sw SegmentedWriteTo) error {
 	}
 	w.sendSamples = false
 	w.startTimestamp = 0
+	w.segmented = true
 
 	current := min(max(first, sw.LastSentSegment()+1), last)
 	w.logger.Info("Reading WAL by segment", "queue", w.name, "firstSegment", first, "startSegment", current, "lastSegment", last)
@@ -455,8 +457,13 @@ func (w *Watcher) watch(segmentNum int, onlySeries bool) error {
 		return w.readAndHandleError(reader, segmentNum, onlySeries, size)
 	}
 
-	checkpointTicker := time.NewTicker(checkpointPeriod)
-	defer checkpointTicker.Stop()
+	// A nil channel never fires, so segmented mode skips checkpoint GC entirely.
+	var checkpointC <-chan time.Time
+	if !w.segmented {
+		checkpointTicker := time.NewTicker(checkpointPeriod)
+		defer checkpointTicker.Stop()
+		checkpointC = checkpointTicker.C
+	}
 
 	segmentTicker := time.NewTicker(segmentCheckPeriod)
 	defer segmentTicker.Stop()
@@ -470,7 +477,7 @@ func (w *Watcher) watch(segmentNum int, onlySeries bool) error {
 		case <-w.quit:
 			return nil
 
-		case <-checkpointTicker.C:
+		case <-checkpointC:
 			// Periodically check if there is a new checkpoint so we can garbage
 			// collect labels. As this is considered an optimisation, we ignore
 			// errors during checkpoint processing. Doing the process asynchronously

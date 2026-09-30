@@ -124,7 +124,7 @@ func DefaultOptions() *Options {
 type dbMetrics struct {
 	r prometheus.Registerer
 
-	// numActiveSeries is the size of the current segment's series table.
+	// numActiveSeries is always 0: there is no global series table to count.
 	numActiveSeries        prometheus.Gauge
 	totalAppendedSamples   *prometheus.CounterVec
 	totalAppendedExemplars prometheus.Counter
@@ -137,7 +137,7 @@ func newDBMetrics(r prometheus.Registerer) *dbMetrics {
 	m := dbMetrics{r: r}
 	m.numActiveSeries = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "prometheus_agent_active_series",
-		Help: "Number of series in the series table of the WAL segment being written",
+		Help: "Always 0 in the series-less agent, which keeps no global series table.",
 	})
 
 	m.totalAppendedSamples = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -664,7 +664,6 @@ func (a *appenderBase) logChunk(start, end int, withRest bool) error {
 	for i := range exs {
 		exs[i].Ref = a.refLocked(eSeries[i])
 	}
-	a.metrics.numActiveSeries.Set(float64(a.tableLenLocked()))
 
 	if err := a.writeRecords(samples, hists, fhists, exs); err != nil {
 		return err
@@ -764,18 +763,9 @@ func (a *appenderBase) refLocked(ps pendingSeries) chunks.HeadSeriesRef {
 	return a.nextRef
 }
 
-func (db *DB) tableLenLocked() int {
-	n := 0
-	for _, es := range db.table {
-		n += len(es)
-	}
-	return n
-}
-
 func (db *DB) resetTableLocked() {
 	db.table = make(map[uint64][]segEntry)
 	db.nextRef = 0
-	db.metrics.numActiveSeries.Set(0)
 }
 
 // rotateLocked starts a new WAL segment with an empty series table. Series that

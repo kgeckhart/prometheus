@@ -23,8 +23,8 @@ Benchmark prototype for the claim: memory is bounded by the segment being writte
 - Exemplars are resolved by the labels passed in, and the latest-exemplar dedupe is gone.
 - No `lastTs`: out-of-order and duplicate samples are no longer rejected.
 - Metadata: still a no-op in the agent.
-- `prometheus_agent_active_series` now means "series in the current segment's table". `prometheus_agent_deleted_series`, `*_checkpoint_*`, `*_corruptions_total`, `*_data_replay_duration_seconds`, `*_out_of_order_samples_total` are removed. New: `prometheus_agent_segment_rotations_total`, `prometheus_agent_segment_rotation_misestimates_total`.
-- The watcher still runs its (harmless) checkpoint-GC ticker.
+- `prometheus_agent_active_series` is always 0 (no global series table). `prometheus_agent_deleted_series`, `*_checkpoint_*`, `*_corruptions_total`, `*_data_replay_duration_seconds`, `*_out_of_order_samples_total` are removed. New: `prometheus_agent_segment_rotations_total`, `prometheus_agent_segment_rotation_misestimates_total`.
+- The watcher skips its checkpoint-GC ticker in segmented mode. The agent builds no checkpoints.
 - WAL segments are only deleted on the truncate tick (`--storage.agent.wal-truncate-frequency`, default 2h). No disk cap.
 - Ignored options: `StripeSize`, `Min/MaxWALTime`, `OutOfOrderTimeWindow`, checkpoint options.
 - Removed-and-readded destination with the same name resumes from its old progress file.
