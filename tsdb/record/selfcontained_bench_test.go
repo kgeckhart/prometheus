@@ -317,3 +317,65 @@ func BenchmarkSelfContainedDecode(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkSelfContainedScale measures the symbols format across commit sizes,
+// and a large commit split into fixed-size records. Reports encode plus decode.
+func BenchmarkSelfContainedScale(b *testing.B) {
+	node := loadBenchShape(b, "node-exporter")
+	ksm := loadBenchShape(b, "ksm")
+	cases := []struct {
+		name   string
+		series []benchSeries
+		chunk  int // Series per record, 0 for one record per commit.
+	}{
+		{"commit=100", node[:100], 0},
+		{"commit=1.7k", node, 0},
+		{"commit=4.2k", loadBenchShape(b, "grafana"), 0},
+		{"commit=108k", ksm, 0},
+		{"commit=108k/record=16k", ksm, 16000},
+		{"commit=108k/record=4k", ksm, 4000},
+		{"commit=108k/record=1k", ksm, 1000},
+	}
+	for _, c := range cases {
+		for _, ct := range []compression.Type{compression.Snappy, compression.Zstd} {
+			b.Run(c.name+"/"+ct, func(b *testing.B) {
+				chunk := c.chunk
+				if chunk == 0 {
+					chunk = len(c.series)
+				}
+				cenc := compression.NewSyncEncodeBuffer()
+				cdec := compression.NewSyncDecodeBuffer()
+				syms := map[string]uint32{}
+				sb := labels.NewScratchBuilder(16)
+				var (
+					refs  []uint32
+					buf   []byte
+					dbuf  []byte
+					dsyms []string
+					out   []benchDecoded
+					size  int
+				)
+				b.ReportAllocs()
+				for b.Loop() {
+					size = 0
+					for i := 0; i < len(c.series); i += chunk {
+						part := c.series[i:min(i+chunk, len(c.series))]
+						buf, refs = encodeSymbolsRecord(part, syms, refs, buf[:0])
+						comp, err := compression.Encode(ct, buf, cenc)
+						if err != nil {
+							b.Fatal(err)
+						}
+						size += len(comp)
+						raw, err := compression.Decode(ct, comp, cdec)
+						if err != nil {
+							b.Fatal(err)
+						}
+						dbuf = append(dbuf[:0], raw...)
+						dsyms, out = decodeSymbolsRecord(dbuf, &sb, dsyms, out)
+					}
+				}
+				reportPerSample(b, len(c.series), size)
+			})
+		}
+	}
+}
