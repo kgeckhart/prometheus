@@ -76,12 +76,13 @@ type WriteStorage struct {
 	recordBuf *record.BuffersPool
 
 	// For timestampTracker.
-	highestTimestamp        *maxTimestamp
-	enableTypeAndUnitLabels bool
+	highestTimestamp         *maxTimestamp
+	enableTypeAndUnitLabels  bool
+	enableMetadataWALRecords bool
 }
 
 // NewWriteStorage creates and runs a WriteStorage.
-func NewWriteStorage(logger *slog.Logger, reg prometheus.Registerer, dir string, flushDeadline time.Duration, sm ReadyScrapeManager, enableTypeAndUnitLabels bool) *WriteStorage {
+func NewWriteStorage(logger *slog.Logger, reg prometheus.Registerer, dir string, flushDeadline time.Duration, sm ReadyScrapeManager, enableTypeAndUnitLabels, enableMetadataWALRecords bool) *WriteStorage {
 	if logger == nil {
 		logger = promslog.NewNopLogger()
 	}
@@ -105,8 +106,9 @@ func NewWriteStorage(logger *slog.Logger, reg prometheus.Registerer, dir string,
 				Help:      "Highest timestamp that has come into the remote storage via the Appender interface, in seconds since epoch. Initialized to 0 when no data has been received yet. Deprecated, check prometheus_remote_storage_queue_highest_timestamp_seconds which is more accurate.",
 			}),
 		},
-		recordBuf:               record.NewBuffersPool(),
-		enableTypeAndUnitLabels: enableTypeAndUnitLabels,
+		recordBuf:                record.NewBuffersPool(),
+		enableTypeAndUnitLabels:  enableTypeAndUnitLabels,
+		enableMetadataWALRecords: enableMetadataWALRecords,
 	}
 	if reg != nil {
 		reg.MustRegister(rws.highestTimestamp)
@@ -218,6 +220,7 @@ func (rws *WriteStorage) ApplyConfig(conf *config.Config) error {
 			rwConf.SendExemplars,
 			rwConf.SendNativeHistograms,
 			rws.enableTypeAndUnitLabels,
+			rws.enableMetadataWALRecords,
 			rwConf.ProtobufMessage,
 			rws.recordBuf,
 			rwConf.FailedRequestLogging,
@@ -228,8 +231,16 @@ func (rws *WriteStorage) ApplyConfig(conf *config.Config) error {
 
 	// Anything remaining in rws.queues is a queue who's config has
 	// changed or was removed from the overall remote write config.
+	newNames := make(map[string]struct{}, len(newQueues))
+	for _, q := range newQueues {
+		newNames[q.storeClient.Name()] = struct{}{}
+	}
 	for _, q := range rws.queues {
 		q.Stop()
+		// A queue replaced under the same name keeps its progress.
+		if _, ok := newNames[q.storeClient.Name()]; !ok {
+			q.RemoveProgress()
+		}
 	}
 
 	for _, hash := range newHashes {
@@ -279,6 +290,22 @@ func (rws *WriteStorage) LowestSentTimestamp() int64 {
 	}
 
 	return lowestTs
+}
+
+// LowestSentSegment returns the lowest WAL segment that every queue has fully
+// sent, or -1 if there are no queues or one has not finished a segment.
+func (rws *WriteStorage) LowestSentSegment() int {
+	rws.mtx.Lock()
+	defer rws.mtx.Unlock()
+
+	if len(rws.queues) == 0 {
+		return -1
+	}
+	lowest := math.MaxInt
+	for _, q := range rws.queues {
+		lowest = min(lowest, q.LastSentSegment())
+	}
+	return lowest
 }
 
 // Close closes the WriteStorage.

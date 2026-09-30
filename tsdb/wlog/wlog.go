@@ -796,6 +796,13 @@ func (w *WL) LastSegmentAndOffset() (seg, offset int, err error) {
 	return seg, offset, err
 }
 
+// SegmentAndOffset is LastSegmentAndOffset without listing the directory.
+func (w *WL) SegmentAndOffset() (seg, offset int) {
+	w.mtx.Lock()
+	defer w.mtx.Unlock()
+	return w.segment.Index(), (w.donePages * pageSize) + w.page.alloc
+}
+
 // Truncate drops all segments before i.
 func (w *WL) Truncate(i int) (err error) {
 	w.metrics.truncateTotal.Inc()

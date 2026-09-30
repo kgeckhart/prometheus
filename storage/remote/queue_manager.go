@@ -45,7 +45,6 @@ import (
 	writev2 "github.com/prometheus/prometheus/prompb/io/prometheus/write/v2"
 	"github.com/prometheus/prometheus/schema"
 	"github.com/prometheus/prometheus/scrape"
-	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/record"
 	"github.com/prometheus/prometheus/tsdb/wlog"
 	"github.com/prometheus/prometheus/util/compression"
@@ -442,14 +441,9 @@ type QueueManager struct {
 	protoMsg    remoteapi.WriteMessageType
 	compr       compression.Type
 
-	seriesMtx      sync.Mutex // Covers seriesLabels, seriesMetadata, droppedSeries and builder.
-	seriesLabels   map[chunks.HeadSeriesRef]labels.Labels
-	seriesMetadata map[chunks.HeadSeriesRef]*metadata.Metadata
-	droppedSeries  map[chunks.HeadSeriesRef]struct{}
-	builder        *labels.Builder
-
-	seriesSegmentMtx     sync.Mutex // Covers seriesSegmentIndexes - if you also lock seriesMtx, take seriesMtx first.
-	seriesSegmentIndexes map[chunks.HeadSeriesRef]int
+	series  *SeriesStorage
+	segProg segmentProgress
+	builder *labels.Builder // Scratch space for relabelLabels; serialised by series.update.
 
 	shards      *shards
 	numShards   int
@@ -458,6 +452,10 @@ type QueueManager struct {
 	wg          sync.WaitGroup
 
 	dataIn, dataDropped, dataOut, dataOutDuration *ewmaRate
+
+	// enqueuedTotal and processedTotal count items put on and taken off shard queues
+	// (sent or dropped), to decide when a WAL segment is fully sent.
+	enqueuedTotal, processedTotal atomic.Uint64
 
 	metrics              *queueManagerMetrics
 	interner             *pool
@@ -488,6 +486,7 @@ func NewQueueManager(
 	enableExemplarRemoteWrite bool,
 	enableNativeHistogramRemoteWrite bool,
 	enableTypeAndUnitLabels bool,
+	enableMetadataWALRecords bool,
 	protoMsg remoteapi.WriteMessageType,
 	recordBuf *record.BuffersPool,
 	failedRequestLogging bool,
@@ -501,6 +500,8 @@ func NewQueueManager(
 	externalLabels.Range(func(l labels.Label) {
 		extLabelsSlice = append(extLabelsSlice, l)
 	})
+
+	walMetadata := protoMsg != remoteapi.WriteV1MessageType && enableMetadataWALRecords
 
 	logger = logger.With(remoteName, client.Name(), endpoint, client.Endpoint())
 	t := &QueueManager{
@@ -516,11 +517,8 @@ func NewQueueManager(
 		enableTypeAndUnitLabels: enableTypeAndUnitLabels,
 		failedRequestLogging:    failedRequestLogging,
 
-		seriesLabels:         make(map[chunks.HeadSeriesRef]labels.Labels),
-		seriesMetadata:       make(map[chunks.HeadSeriesRef]*metadata.Metadata),
-		seriesSegmentIndexes: make(map[chunks.HeadSeriesRef]int),
-		droppedSeries:        make(map[chunks.HeadSeriesRef]struct{}),
-		builder:              labels.NewBuilder(labels.EmptyLabels()),
+		series:  NewSeriesStorage(walMetadata),
+		builder: labels.NewBuilder(labels.EmptyLabels()),
 
 		numShards:   cfg.MinShards,
 		reshardChan: make(chan int),
@@ -539,8 +537,7 @@ func NewQueueManager(
 		compr:    compression.Snappy, // Hardcoded for now, but scaffolding exists for likely future use.
 	}
 
-	walMetadata := t.protoMsg != remoteapi.WriteV1MessageType
-
+	t.segProg.init(dir, client.Name())
 	t.watcher = wlog.NewWatcher(watcherMetrics, readerMetrics, logger, client.Name(), t, dir, enableExemplarRemoteWrite, enableNativeHistogramRemoteWrite, walMetadata, recordBuf)
 
 	// The current MetadataWatcher implementation is mutually exclusive
@@ -736,23 +733,19 @@ outer:
 			t.metrics.droppedSamplesTotal.WithLabelValues(reasonTooOld).Inc()
 			continue
 		}
-		t.seriesMtx.Lock()
-		lbls, ok := t.seriesLabels[s.Ref]
+		lbls, meta, hash, ok, dropped := t.series.LookupHashed(s.Ref)
 		if !ok {
 			t.dataDropped.incr(1)
-			if _, ok := t.droppedSeries[s.Ref]; !ok {
+			if dropped {
+				t.metrics.droppedSamplesTotal.WithLabelValues(reasonDroppedSeries).Inc()
+			} else {
 				t.logger.Info("Dropped sample for series that was not explicitly dropped via relabelling", "ref", s.Ref)
 				t.metrics.droppedSamplesTotal.WithLabelValues(reasonUnintentionalDroppedSeries).Inc()
-			} else {
-				t.metrics.droppedSamplesTotal.WithLabelValues(reasonDroppedSeries).Inc()
 			}
-			t.seriesMtx.Unlock()
 			continue
 		}
 		// TODO(cstyan): Handle or at least log an error if no metadata is found.
 		// See https://github.com/prometheus/prometheus/issues/14405
-		meta := t.seriesMetadata[s.Ref]
-		t.seriesMtx.Unlock()
 		// Start with a very small backoff. This should not be t.cfg.MinBackoff
 		// as it can happen without errors, and we want to pickup work after
 		// filling a queue/resharding as quickly as possible.
@@ -764,7 +757,7 @@ outer:
 				return false
 			default:
 			}
-			if t.shards.enqueue(s.Ref, timeSeries{
+			if t.shards.enqueue(hash, timeSeries{
 				seriesLabels:   lbls,
 				metadata:       meta,
 				startTimestamp: s.ST,
@@ -799,22 +792,18 @@ outer:
 			t.metrics.droppedExemplarsTotal.WithLabelValues(reasonTooOld).Inc()
 			continue
 		}
-		t.seriesMtx.Lock()
-		lbls, ok := t.seriesLabels[e.Ref]
+		lbls, meta, hash, ok, dropped := t.series.LookupHashed(e.Ref)
 		if !ok {
 			// Track dropped exemplars in the same EWMA for sharding calc.
 			t.dataDropped.incr(1)
-			if _, ok := t.droppedSeries[e.Ref]; !ok {
+			if dropped {
+				t.metrics.droppedExemplarsTotal.WithLabelValues(reasonDroppedSeries).Inc()
+			} else {
 				t.logger.Info("Dropped exemplar for series that was not explicitly dropped via relabelling", "ref", e.Ref)
 				t.metrics.droppedExemplarsTotal.WithLabelValues(reasonUnintentionalDroppedSeries).Inc()
-			} else {
-				t.metrics.droppedExemplarsTotal.WithLabelValues(reasonDroppedSeries).Inc()
 			}
-			t.seriesMtx.Unlock()
 			continue
 		}
-		meta := t.seriesMetadata[e.Ref]
-		t.seriesMtx.Unlock()
 		// This will only loop if the queues are being resharded.
 		backoff := t.cfg.MinBackoff
 		for {
@@ -823,7 +812,7 @@ outer:
 				return false
 			default:
 			}
-			if t.shards.enqueue(e.Ref, timeSeries{
+			if t.shards.enqueue(hash, timeSeries{
 				seriesLabels:   lbls,
 				metadata:       meta,
 				timestamp:      e.T,
@@ -862,21 +851,17 @@ outer:
 			t.logger.Warn("Dropped native histogram with custom buckets (NHCB) as remote write v1 does not support it", "ref", h.Ref)
 			continue
 		}
-		t.seriesMtx.Lock()
-		lbls, ok := t.seriesLabels[h.Ref]
+		lbls, meta, hash, ok, dropped := t.series.LookupHashed(h.Ref)
 		if !ok {
 			t.dataDropped.incr(1)
-			if _, ok := t.droppedSeries[h.Ref]; !ok {
+			if dropped {
+				t.metrics.droppedHistogramsTotal.WithLabelValues(reasonDroppedSeries).Inc()
+			} else {
 				t.logger.Info("Dropped histogram for series that was not explicitly dropped via relabelling", "ref", h.Ref)
 				t.metrics.droppedHistogramsTotal.WithLabelValues(reasonUnintentionalDroppedSeries).Inc()
-			} else {
-				t.metrics.droppedHistogramsTotal.WithLabelValues(reasonDroppedSeries).Inc()
 			}
-			t.seriesMtx.Unlock()
 			continue
 		}
-		meta := t.seriesMetadata[h.Ref]
-		t.seriesMtx.Unlock()
 
 		backoff := model.Duration(5 * time.Millisecond)
 		for {
@@ -885,7 +870,7 @@ outer:
 				return false
 			default:
 			}
-			if t.shards.enqueue(h.Ref, timeSeries{
+			if t.shards.enqueue(hash, timeSeries{
 				seriesLabels:   lbls,
 				metadata:       meta,
 				startTimestamp: h.ST,
@@ -924,21 +909,17 @@ outer:
 			t.logger.Warn("Dropped float native histogram with custom buckets (NHCB) as remote write v1 does not support it", "ref", h.Ref)
 			continue
 		}
-		t.seriesMtx.Lock()
-		lbls, ok := t.seriesLabels[h.Ref]
+		lbls, meta, hash, ok, dropped := t.series.LookupHashed(h.Ref)
 		if !ok {
 			t.dataDropped.incr(1)
-			if _, ok := t.droppedSeries[h.Ref]; !ok {
+			if dropped {
+				t.metrics.droppedHistogramsTotal.WithLabelValues(reasonDroppedSeries).Inc()
+			} else {
 				t.logger.Info("Dropped histogram for series that was not explicitly dropped via relabelling", "ref", h.Ref)
 				t.metrics.droppedHistogramsTotal.WithLabelValues(reasonUnintentionalDroppedSeries).Inc()
-			} else {
-				t.metrics.droppedHistogramsTotal.WithLabelValues(reasonDroppedSeries).Inc()
 			}
-			t.seriesMtx.Unlock()
 			continue
 		}
-		meta := t.seriesMetadata[h.Ref]
-		t.seriesMtx.Unlock()
 
 		backoff := model.Duration(5 * time.Millisecond)
 		for {
@@ -947,7 +928,7 @@ outer:
 				return false
 			default:
 			}
-			if t.shards.enqueue(h.Ref, timeSeries{
+			if t.shards.enqueue(hash, timeSeries{
 				seriesLabels:   lbls,
 				metadata:       meta,
 				startTimestamp: h.ST,
@@ -1012,71 +993,37 @@ func (t *QueueManager) Stop() {
 
 // StoreSeries keeps track of which series we know about for lookups when sending samples to remote.
 func (t *QueueManager) StoreSeries(series []record.RefSeries, index int) {
-	t.seriesMtx.Lock()
-	defer t.seriesMtx.Unlock()
-	t.seriesSegmentMtx.Lock()
-	defer t.seriesSegmentMtx.Unlock()
-	for _, s := range series {
-		// Just make sure all the Refs of Series will insert into seriesSegmentIndexes map for tracking.
-		t.seriesSegmentIndexes[s.Ref] = index
+	t.series.Update(series, index, t.relabelLabels)
+}
 
-		t.builder.Reset(s.Labels)
-		processExternalLabels(t.builder, t.externalLabels)
-		keep := relabel.ProcessBuilder(t.builder, t.relabelConfigs...)
-		if !keep {
-			t.droppedSeries[s.Ref] = struct{}{}
-			continue
-		}
-		lbls := t.builder.Labels()
-		t.seriesLabels[s.Ref] = lbls
+// relabelLabels applies external labels and the configured relabel rules to
+// lbls, returning the transformed labels and whether the series should be kept.
+// Intended for use as the callback to series.update.
+func (t *QueueManager) relabelLabels(lbls labels.Labels) (labels.Labels, bool) {
+	t.builder.Reset(lbls)
+	processExternalLabels(t.builder, t.externalLabels)
+	if !relabel.ProcessBuilder(t.builder, t.relabelConfigs...) {
+		return labels.EmptyLabels(), false
 	}
+	return t.builder.Labels(), true
 }
 
 // StoreMetadata keeps track of known series' metadata for lookups when sending samples to remote.
 func (t *QueueManager) StoreMetadata(meta []record.RefMetadata) {
-	if t.protoMsg == remoteapi.WriteV1MessageType {
-		return
-	}
-
-	t.seriesMtx.Lock()
-	defer t.seriesMtx.Unlock()
-	for _, m := range meta {
-		t.seriesMetadata[m.Ref] = &metadata.Metadata{
-			Type: record.ToMetricType(m.Type),
-			Unit: m.Unit,
-			Help: m.Help,
-		}
-	}
+	t.series.UpdateMetadata(meta)
 }
 
 // UpdateSeriesSegment updates the segment number held against the series,
 // so we can trim older ones in SeriesReset.
 func (t *QueueManager) UpdateSeriesSegment(series []record.RefSeries, index int) {
-	t.seriesSegmentMtx.Lock()
-	defer t.seriesSegmentMtx.Unlock()
-	for _, s := range series {
-		t.seriesSegmentIndexes[s.Ref] = index
-	}
+	t.series.UpdateSegment(series, index)
 }
 
 // SeriesReset is used when reading a checkpoint. WAL Watcher should have
 // stored series records with the checkpoints index number, so we can now
 // delete any ref ID's lower than that # from the two maps.
 func (t *QueueManager) SeriesReset(index int) {
-	t.seriesMtx.Lock()
-	defer t.seriesMtx.Unlock()
-	t.seriesSegmentMtx.Lock()
-	defer t.seriesSegmentMtx.Unlock()
-	// Check for series that are in segments older than the checkpoint
-	// that were not also present in the checkpoint.
-	for k, v := range t.seriesSegmentIndexes {
-		if v < index {
-			delete(t.seriesSegmentIndexes, k)
-			delete(t.seriesLabels, k)
-			delete(t.seriesMetadata, k)
-			delete(t.droppedSeries, k)
-		}
-	}
+	t.series.Reset(index)
 }
 
 // SetClient updates the client used by a queue. Used when only client specific
@@ -1361,10 +1308,11 @@ func (s *shards) stop() {
 // retry. A shard is full when its configured capacity has been reached,
 // specifically, when s.queues[shard] has filled its batchQueue channel and the
 // partial batch has also been filled.
-func (s *shards) enqueue(ref chunks.HeadSeriesRef, data timeSeries) bool {
+func (s *shards) enqueue(labelsHash uint64, data timeSeries) bool {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
-	shard := uint64(ref) % uint64(len(s.queues))
+	// Refs are segment-local, so route by labels to keep a series on one shard.
+	shard := labelsHash % uint64(len(s.queues))
 	select {
 	case <-s.softShutdown:
 		return false
@@ -1386,6 +1334,7 @@ func (s *shards) enqueue(ref chunks.HeadSeriesRef, data timeSeries) bool {
 		default:
 			return true
 		}
+		s.qm.enqueuedTotal.Inc()
 		s.qm.metrics.highestTimestamp.Set(float64(data.timestamp / 1000))
 		return true
 	}
@@ -1754,6 +1703,9 @@ func (s *shards) updateMetrics(_ context.Context, err error, sampleCount, exempl
 	s.enqueuedSamples.Sub(int64(sampleCount))
 	s.enqueuedExemplars.Sub(int64(exemplarCount))
 	s.enqueuedHistograms.Sub(int64(histogramCount))
+
+	s.qm.processedTotal.Add(uint64(sampleCount + exemplarCount + histogramCount))
+	s.qm.advanceSentSegments()
 }
 
 // sendSamplesWithBackoff to the remote storage with backoff for recoverable errors.

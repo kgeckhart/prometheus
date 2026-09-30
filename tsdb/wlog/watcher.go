@@ -72,6 +72,15 @@ type WriteTo interface {
 	SeriesReset(int)
 }
 
+// SegmentedWriteTo is implemented by a WriteTo that wants the watcher to read
+// segment by segment, each with its own series table (series-less agent).
+type SegmentedWriteTo interface {
+	// SegmentDone is called once the watcher has enqueued all of segment n.
+	SegmentDone(n int)
+	// LastSentSegment is the last segment fully sent, or -1. The watcher resumes after it.
+	LastSentSegment() int
+}
+
 // WriteNotified notifies the watcher that data has been written so that it can read.
 type WriteNotified interface {
 	Notify()
@@ -299,6 +308,9 @@ func (w *Watcher) loop() {
 // Run the watcher, which will tail the WAL until the quit channel is closed
 // or an error case is hit.
 func (w *Watcher) Run() error {
+	if sw, ok := w.writer.(SegmentedWriteTo); ok {
+		return w.runSegmented(sw)
+	}
 	_, lastSegment, err := Segments(w.walDir)
 	if err != nil {
 		return fmt.Errorf("Segments: %w", err)
@@ -347,6 +359,40 @@ func (w *Watcher) Run() error {
 		currentSegment++
 	}
 
+	return nil
+}
+
+// runSegmented reads every segment from the one after the last fully sent
+// segment, dropping the previous segment's series table when it enters the next.
+// Old samples are sent too, so startTimestamp filtering is off.
+func (w *Watcher) runSegmented(sw SegmentedWriteTo) error {
+	first, last, err := Segments(w.walDir)
+	if err != nil {
+		return fmt.Errorf("Segments: %w", err)
+	}
+	w.sendSamples = false
+	w.startTimestamp = 0
+
+	current := min(max(first, sw.LastSentSegment()+1), last)
+	w.logger.Info("Reading WAL by segment", "queue", w.name, "firstSegment", first, "startSegment", current, "lastSegment", last)
+	for !isClosed(w.quit) {
+		w.currentSegmentMetric.Set(float64(current))
+
+		// Refs are segment-local, so the previous segment's series are useless from here.
+		w.writer.SeriesReset(current)
+		if err := w.watch(current, false); err != nil && !errors.Is(err, ErrIgnorable) {
+			return err
+		}
+		if isClosed(w.quit) {
+			return nil
+		}
+		sw.SegmentDone(current)
+
+		if current == w.MaxSegment {
+			return nil
+		}
+		current++
+	}
 	return nil
 }
 

@@ -66,7 +66,7 @@ type Storage struct {
 var _ storage.Storage = &Storage{}
 
 // NewStorage returns a remote.Storage.
-func NewStorage(l *slog.Logger, reg prometheus.Registerer, stCallback startTimeCallback, walDir string, flushDeadline time.Duration, sm ReadyScrapeManager, enableTypeAndUnitLabels bool) *Storage {
+func NewStorage(l *slog.Logger, reg prometheus.Registerer, stCallback startTimeCallback, walDir string, flushDeadline time.Duration, sm ReadyScrapeManager, enableTypeAndUnitLabels, enableMetadataWALRecords bool) *Storage {
 	if l == nil {
 		l = promslog.NewNopLogger()
 	}
@@ -78,7 +78,7 @@ func NewStorage(l *slog.Logger, reg prometheus.Registerer, stCallback startTimeC
 		deduper:                deduper,
 		localStartTimeCallback: stCallback,
 	}
-	s.rws = NewWriteStorage(s.logger, reg, walDir, flushDeadline, sm, enableTypeAndUnitLabels)
+	s.rws = NewWriteStorage(s.logger, reg, walDir, flushDeadline, sm, enableTypeAndUnitLabels, enableMetadataWALRecords)
 	return s
 }
 
@@ -203,6 +203,11 @@ func (s *Storage) AppenderV2(ctx context.Context) storage.AppenderV2 {
 // LowestSentTimestamp returns the lowest sent timestamp across all queues.
 func (s *Storage) LowestSentTimestamp() int64 {
 	return s.rws.LowestSentTimestamp()
+}
+
+// LowestSentSegment returns the lowest WAL segment fully sent by every queue, or -1.
+func (s *Storage) LowestSentSegment() int {
+	return s.rws.LowestSentSegment()
 }
 
 // Close the background processing of the storage queues.
