@@ -19,6 +19,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -375,6 +376,157 @@ func BenchmarkSelfContainedScale(b *testing.B) {
 					}
 				}
 				reportPerSample(b, len(c.series), size)
+			})
+		}
+	}
+}
+
+// Format 5: each series stores a bitmask of labels equal to the same position
+// in the previous series, and only the differing labels inline. Series in one
+// scrape mostly share job, instance and metric name with their neighbour, so
+// this needs string compares instead of symbol hashing.
+const benchPrevDeltaType Type = 202
+
+type prevDeltaEncoder struct {
+	prev, cur []labels.Label
+}
+
+func (p *prevDeltaEncoder) encode(series []benchSeries, b []byte) []byte {
+	e := encoding.Encbuf{B: b[:0]}
+	e.PutByte(byte(benchPrevDeltaType))
+	e.PutBE64int64(benchBaseT)
+	e.PutUvarint(len(series))
+	p.prev = p.prev[:0]
+	for _, s := range series {
+		p.cur = p.cur[:0]
+		s.lset.Range(func(l labels.Label) { p.cur = append(p.cur, l) })
+		var mask uint64
+		for i := 0; i < len(p.cur) && i < len(p.prev) && i < 64; i++ {
+			if p.cur[i] == p.prev[i] {
+				mask |= 1 << i
+			}
+		}
+		e.PutUvarint(len(p.cur))
+		e.PutUvarint64(mask)
+		for i, l := range p.cur {
+			if i < 64 && mask&(1<<i) != 0 {
+				continue
+			}
+			e.PutUvarintStr(l.Name)
+			e.PutUvarintStr(l.Value)
+		}
+		e.PutVarint64(0)
+		e.PutBE64(math.Float64bits(s.v))
+		p.prev, p.cur = p.cur, p.prev
+	}
+	return e.Get()
+}
+
+func decodePrevDeltaRecord(rec []byte, b *labels.ScratchBuilder, prev, cur []labels.Label, out []benchDecoded) ([]labels.Label, []labels.Label, []benchDecoded) {
+	d := encoding.Decbuf{B: rec}
+	d.Byte()
+	baseT := d.Be64int64()
+	out = out[:0]
+	prev = prev[:0]
+	for n := d.Uvarint(); n > 0; n-- {
+		nl := d.Uvarint()
+		mask := d.Uvarint64()
+		cur = cur[:0]
+		b.Reset()
+		for i := range nl {
+			var l labels.Label
+			if i < 64 && mask&(1<<i) != 0 {
+				l = prev[i]
+			} else {
+				l.Name = yoloString(d.UvarintBytes())
+				l.Value = yoloString(d.UvarintBytes())
+			}
+			cur = append(cur, l)
+			b.Add(l.Name, l.Value)
+		}
+		t := baseT + d.Varint64()
+		v := math.Float64frombits(d.Be64())
+		out = append(out, benchDecoded{lset: b.Labels(), t: t, v: v})
+		prev, cur = cur, prev
+	}
+	return prev, cur, out
+}
+
+func BenchmarkSelfContainedPrevDelta(b *testing.B) {
+	for _, shape := range []string{"node-exporter", "cadvisor", "grafana", "ksm"} {
+		series := loadBenchShape(b, shape)
+		for _, ct := range []compression.Type{compression.Snappy, compression.Zstd} {
+			cenc := compression.NewSyncEncodeBuffer()
+			cdec := compression.NewSyncDecodeBuffer()
+			var p prevDeltaEncoder
+			var buf []byte
+			b.Run(shape+"/encode/"+ct, func(b *testing.B) {
+				var size int
+				b.ReportAllocs()
+				for b.Loop() {
+					buf = p.encode(series, buf[:0])
+					c, err := compression.Encode(ct, buf, cenc)
+					if err != nil {
+						b.Fatal(err)
+					}
+					size = len(c)
+				}
+				reportPerSample(b, len(series), size)
+			})
+			rec := p.encode(series, nil)
+			c, err := compression.Encode(ct, rec, cenc)
+			require.NoError(b, err)
+			c = append([]byte(nil), c...)
+			b.Run(shape+"/decode/"+ct, func(b *testing.B) {
+				sb := labels.NewScratchBuilder(16)
+				var (
+					dbuf      []byte
+					prev, cur []labels.Label
+					out       []benchDecoded
+				)
+				b.ReportAllocs()
+				for b.Loop() {
+					raw, err := compression.Decode(ct, c, cdec)
+					if err != nil {
+						b.Fatal(err)
+					}
+					dbuf = append(dbuf[:0], raw...)
+					prev, cur, out = decodePrevDeltaRecord(dbuf, &sb, prev, cur, out)
+				}
+				for i := range out {
+					if !labels.Equal(out[i].lset, series[i].lset) {
+						b.Fatalf("series %d: got %s, want %s", i, out[i].lset, series[i].lset)
+					}
+				}
+				reportPerSample(b, len(series), len(c))
+			})
+		}
+	}
+}
+
+// BenchmarkSelfContainedPrevDeltaSplit measures a large commit split into
+// fixed-size prev-delta records, each compressed on its own.
+func BenchmarkSelfContainedPrevDeltaSplit(b *testing.B) {
+	ksm := loadBenchShape(b, "ksm")
+	for _, chunk := range []int{len(ksm), 16000, 4000, 1000} {
+		for _, ct := range []compression.Type{compression.Snappy, compression.Zstd} {
+			b.Run("record="+strconv.Itoa(chunk)+"/"+ct, func(b *testing.B) {
+				cenc := compression.NewSyncEncodeBuffer()
+				var p prevDeltaEncoder
+				var buf []byte
+				var size int
+				for b.Loop() {
+					size = 0
+					for i := 0; i < len(ksm); i += chunk {
+						buf = p.encode(ksm[i:min(i+chunk, len(ksm))], buf[:0])
+						c, err := compression.Encode(ct, buf, cenc)
+						if err != nil {
+							b.Fatal(err)
+						}
+						size += len(c)
+					}
+				}
+				reportPerSample(b, len(ksm), size)
 			})
 		}
 	}
