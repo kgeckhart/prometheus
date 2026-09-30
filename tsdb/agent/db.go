@@ -218,9 +218,10 @@ type DB struct {
 
 	// segMu guards the series table of the segment being written. Commits are
 	// serialized on it, so a batch never straddles a rotation.
-	segMu   sync.Mutex
-	table   map[uint64][]segEntry
-	nextRef chunks.HeadSeriesRef
+	segMu      sync.Mutex
+	table      map[uint64]segEntry
+	collisions map[uint64][]segEntry // Series whose hash is already taken in table.
+	nextRef    chunks.HeadSeriesRef
 
 	donec chan struct{}
 	stopc chan struct{}
@@ -260,7 +261,8 @@ func Open(l *slog.Logger, reg prometheus.Registerer, rs *remote.Storage, dir str
 		wal:    w,
 		locker: locker,
 
-		table: make(map[uint64][]segEntry),
+		table:      make(map[uint64]segEntry),
+		collisions: make(map[uint64][]segEntry),
 
 		donec: make(chan struct{}),
 		stopc: make(chan struct{}),
@@ -752,19 +754,30 @@ func (a *appenderBase) writeRecords(samples []record.RefSample, hists []record.R
 // the series records of the current log call when it is new to this segment.
 // Must be called with segMu held.
 func (a *appenderBase) refLocked(ps pendingSeries) chunks.HeadSeriesRef {
-	for _, e := range a.table[ps.hash] {
-		if labels.Equal(e.lset, ps.lset) {
-			return e.ref
+	e, ok := a.table[ps.hash]
+	switch {
+	case !ok:
+		a.nextRef++
+		a.table[ps.hash] = segEntry{ref: a.nextRef, lset: ps.lset}
+	case labels.Equal(e.lset, ps.lset):
+		return e.ref
+	default:
+		for _, c := range a.collisions[ps.hash] {
+			if labels.Equal(c.lset, ps.lset) {
+				return c.ref
+			}
 		}
+		a.nextRef++
+		a.collisions[ps.hash] = append(a.collisions[ps.hash], segEntry{ref: a.nextRef, lset: ps.lset})
 	}
-	a.nextRef++
-	a.table[ps.hash] = append(a.table[ps.hash], segEntry{ref: a.nextRef, lset: ps.lset})
 	a.seriesBuf = append(a.seriesBuf, record.RefSeries{Ref: a.nextRef, Labels: ps.lset})
 	return a.nextRef
 }
 
 func (db *DB) resetTableLocked() {
-	db.table = make(map[uint64][]segEntry)
+	// Size for the segment just finished; most of its series are re-emitted in the next.
+	db.table = make(map[uint64]segEntry, db.nextRef)
+	db.collisions = make(map[uint64][]segEntry)
 	db.nextRef = 0
 }
 
