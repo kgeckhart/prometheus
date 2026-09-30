@@ -1019,6 +1019,9 @@ type scrapeCache struct {
 	// Series that were seen in the current and previous scrape, for staleness detection.
 	seriesCur  map[storage.SeriesRef]*cacheEntry
 	seriesPrev map[storage.SeriesRef]*cacheEntry
+	// Same as above for series whose appender returned SeriesRef 0, which can't be keyed by ref.
+	seriesCurNoRef  map[*cacheEntry]struct{}
+	seriesPrevNoRef map[*cacheEntry]struct{}
 
 	// TODO(bwplotka): Consider moving metadata caching to head. See
 	// https://github.com/prometheus/prometheus/issues/17619.
@@ -1046,12 +1049,14 @@ func (m *metaEntry) size() int {
 
 func newScrapeCache(metrics *scrapeMetrics) *scrapeCache {
 	return &scrapeCache{
-		series:        map[string]*cacheEntry{},
-		droppedSeries: map[string]*uint64{},
-		seriesCur:     map[storage.SeriesRef]*cacheEntry{},
-		seriesPrev:    map[storage.SeriesRef]*cacheEntry{},
-		metadata:      map[string]*metaEntry{},
-		metrics:       metrics,
+		series:          map[string]*cacheEntry{},
+		droppedSeries:   map[string]*uint64{},
+		seriesCur:       map[storage.SeriesRef]*cacheEntry{},
+		seriesPrev:      map[storage.SeriesRef]*cacheEntry{},
+		seriesCurNoRef:  map[*cacheEntry]struct{}{},
+		seriesPrevNoRef: map[*cacheEntry]struct{}{},
+		metadata:        map[string]*metaEntry{},
+		metrics:         metrics,
 	}
 }
 
@@ -1101,6 +1106,8 @@ func (c *scrapeCache) iterDone(flushCache bool) {
 	// Swap current and previous series then clear the new current, to save allocations.
 	c.seriesPrev, c.seriesCur = c.seriesCur, c.seriesPrev
 	clear(c.seriesCur)
+	c.seriesPrevNoRef, c.seriesCurNoRef = c.seriesCurNoRef, c.seriesPrevNoRef
+	clear(c.seriesCurNoRef)
 
 	c.iter++
 }
@@ -1145,6 +1152,16 @@ func (c *scrapeCache) updateRef(ce *cacheEntry, ref storage.SeriesRef) {
 	if ce.ref != 0 {
 		moveStaleness(c.seriesPrev, ce, ref)
 		moveStaleness(c.seriesCur, ce, ref)
+	} else {
+		// Tracked without a ref so far, re-key under the new one.
+		if _, ok := c.seriesPrevNoRef[ce]; ok {
+			delete(c.seriesPrevNoRef, ce)
+			c.seriesPrev[ref] = ce
+		}
+		if _, ok := c.seriesCurNoRef[ce]; ok {
+			delete(c.seriesCurNoRef, ce)
+			c.seriesCur[ref] = ce
+		}
 	}
 	ce.ref = ref
 }
@@ -1161,6 +1178,10 @@ func moveStaleness(tracked map[storage.SeriesRef]*cacheEntry, ce *cacheEntry, re
 }
 
 func (c *scrapeCache) trackStaleness(ref storage.SeriesRef, ce *cacheEntry) {
+	if ref == 0 {
+		c.seriesCurNoRef[ce] = struct{}{}
+		return
+	}
 	c.seriesCur[ref] = ce
 }
 
@@ -1168,7 +1189,14 @@ func (c *scrapeCache) forEachStale(f func(storage.SeriesRef, labels.Labels) bool
 	for ref, ce := range c.seriesPrev {
 		if _, ok := c.seriesCur[ref]; !ok {
 			if !f(ce.ref, ce.lset) {
-				break
+				return
+			}
+		}
+	}
+	for ce := range c.seriesPrevNoRef {
+		if _, ok := c.seriesCurNoRef[ce]; !ok {
+			if !f(ce.ref, ce.lset) {
+				return
 			}
 		}
 	}
@@ -1962,7 +1990,7 @@ loop:
 			if ce != nil && ref != 0 {
 				sl.cache.updateRef(ce, ref)
 			}
-			if (parsedTimestamp == nil || sl.trackTimestampsStaleness) && ce != nil && ce.ref != 0 {
+			if (parsedTimestamp == nil || sl.trackTimestampsStaleness) && ce != nil {
 				sl.cache.trackStaleness(ce.ref, ce)
 			}
 		}
@@ -1981,7 +2009,7 @@ loop:
 		// it in the scrape cache because we don't need to emit StaleNaNs for it when it disappears.
 		if !seriesCached && sampleAdded {
 			ce = sl.cache.addRef(met, ref, lset)
-			if ce != nil && ce.ref != 0 && (parsedTimestamp == nil || sl.trackTimestampsStaleness) {
+			if ce != nil && (parsedTimestamp == nil || sl.trackTimestampsStaleness) {
 				// Bypass staleness logic if there is an explicit timestamp.
 				// But make sure we only do this if we have a cache entry (ce) for our series.
 				sl.cache.trackStaleness(ref, ce)

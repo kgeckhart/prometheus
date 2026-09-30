@@ -355,13 +355,13 @@ loop:
 
 		// We track staleness for a series to ensure that if it disappears in a future scrape,
 		// we can emit a StaleNaN marker to terminate the series (which also helps in eventually cleaning up stCache).
-		// We only track it if there are no errors and we have a valid storage reference (ce.ref != 0).
+		// We only track it if there are no errors. Series with ref 0 are tracked by cache entry.
 		// We track it if:
 		// - There is no explicit timestamp in the scrape (parsedTimestamp == nil).
 		// - Or we explicitly track staleness for timestamps (sl.trackTimestampsStaleness).
 		// - Or we are synthesizing start times (stCache != nil), so we can clear stCache if it goes stale.
 		shouldTrackStaleness := parsedTimestamp == nil || sl.trackTimestampsStaleness || stCache != nil
-		if ce != nil && ce.ref != 0 && shouldTrackStaleness && sampleAdded {
+		if ce != nil && shouldTrackStaleness && sampleAdded {
 			sl.cache.trackStaleness(ce.ref, ce)
 		}
 

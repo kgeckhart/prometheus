@@ -15,6 +15,7 @@ package scrape
 
 import (
 	"bytes"
+	"cmp"
 	"compress/gzip"
 	"context"
 	"crypto/tls"
@@ -32,6 +33,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -3240,6 +3242,131 @@ func testScrapeLoopSeriesRefChange(t *testing.T, appV2 bool) {
 			require.Equal(t, tc.expectedRef, ce.ref)
 		})
 	}
+}
+
+func TestScrapeLoopStaleMarkersWithZeroRef(t *testing.T) {
+	foreachAppendable(t, func(t *testing.T, appV2 bool) {
+		testScrapeLoopStaleMarkersWithZeroRef(t, appV2)
+	})
+}
+
+// testScrapeLoopStaleMarkersWithZeroRef tests staleness against a storage that always
+// returns storage.SeriesRef 0.
+func testScrapeLoopStaleMarkersWithZeroRef(t *testing.T, appV2 bool) {
+	firstScrape := time.Unix(1600000000, 0)
+	scrapeTime := func(scrape int) time.Time {
+		return firstScrape.Add(time.Duration(scrape) * 15 * time.Second)
+	}
+	sample := func(name string, scrape int, v float64) teststorage.Sample {
+		return teststorage.Sample{
+			L: labels.FromStrings(model.MetricNameLabel, name),
+			T: timestamp.FromTime(scrapeTime(scrape)),
+			V: v,
+		}
+	}
+	stale := math.Float64frombits(value.StaleNaN)
+
+	for _, tc := range []struct {
+		name            string
+		bodies          []string
+		expectedSamples []teststorage.Sample
+	}{
+		{
+			name:   "series disappears",
+			bodies: []string{"metric_a 1\nmetric_b 2\n", "metric_a 3\n", "metric_a 4\n"},
+			expectedSamples: []teststorage.Sample{
+				sample("metric_a", 0, 1), sample("metric_b", 0, 2),
+				sample("metric_a", 1, 3), sample("metric_b", 1, stale),
+				sample("metric_a", 2, 4),
+			},
+		},
+		{
+			name:   "failed scrape marks all series stale",
+			bodies: []string{"metric_a 1\nmetric_b 2\n", ""},
+			expectedSamples: []teststorage.Sample{
+				sample("metric_a", 0, 1), sample("metric_b", 0, 2),
+				sample("metric_a", 1, stale), sample("metric_b", 1, stale),
+			},
+		},
+		{
+			name:   "series that comes back is marked stale again on the next disappearance",
+			bodies: []string{"metric_a 1\n", "metric_b 2\n", "metric_a 3\n", "metric_b 4\n"},
+			expectedSamples: []teststorage.Sample{
+				sample("metric_a", 0, 1),
+				sample("metric_b", 1, 2), sample("metric_a", 1, stale),
+				sample("metric_a", 2, 3), sample("metric_b", 2, stale),
+				sample("metric_b", 3, 4), sample("metric_a", 3, stale),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := teststorage.NewAppendable().WithRefFn(func(labels.Labels) storage.SeriesRef { return 0 })
+			sl, _ := newTestScrapeLoop(t, withAppendable(app, appV2))
+
+			for i, body := range tc.bodies {
+				appender := sl.appender()
+				_, _, _, err := appender.append([]byte(body), "text/plain", scrapeTime(i))
+				require.NoError(t, err)
+				require.NoError(t, appender.Commit())
+			}
+
+			// Stale markers within a scrape come out in map order.
+			byTimeAndName := func(a, b teststorage.Sample) int {
+				return cmp.Or(cmp.Compare(a.T, b.T), strings.Compare(a.L.Get(model.MetricNameLabel), b.L.Get(model.MetricNameLabel)))
+			}
+			got := app.ResultSamples()
+			slices.SortStableFunc(got, byTimeAndName)
+			slices.SortStableFunc(tc.expectedSamples, byTimeAndName)
+			teststorage.RequireEqual(t, tc.expectedSamples, got)
+		})
+	}
+}
+
+func TestScrapeLoopStopMarksZeroRefSeriesStale(t *testing.T) {
+	foreachAppendable(t, func(t *testing.T, appV2 bool) {
+		testScrapeLoopStopMarksZeroRefSeriesStale(t, appV2)
+	})
+}
+
+func testScrapeLoopStopMarksZeroRefSeriesStale(t *testing.T, appV2 bool) {
+	signal := make(chan struct{}, 1)
+
+	appTest := teststorage.NewAppendable().WithRefFn(func(labels.Labels) storage.SeriesRef { return 0 })
+	sl, scraper := newTestScrapeLoop(t, withAppendable(appTest, appV2), func(sl *scrapeLoop) {
+		sl.fallbackScrapeProtocol = "text/plain"
+	})
+
+	numScrapes := 0
+	scraper.scrapeFunc = func(ctx context.Context, w io.Writer) error {
+		numScrapes++
+		if numScrapes == 2 {
+			go sl.stop()
+			<-sl.ctx.Done()
+		}
+		_, _ = w.Write([]byte("metric_a 42\n"))
+		return ctx.Err()
+	}
+
+	go func() {
+		sl.run(nil)
+		signal <- struct{}{}
+	}()
+
+	select {
+	case <-signal:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "Scrape wasn't stopped.")
+	}
+
+	var last teststorage.Sample
+	var found bool
+	for _, s := range appTest.ResultSamples() {
+		if s.L.Get(model.MetricNameLabel) == "metric_a" {
+			last, found = s, true
+		}
+	}
+	require.True(t, found)
+	require.True(t, value.IsStaleNaN(last.V), "Last metric_a sample should be a stale marker, got %x", math.Float64bits(last.V))
 }
 
 func TestScrapeLoopCache(t *testing.T) {
