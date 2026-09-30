@@ -80,7 +80,8 @@ type Options struct {
 
 	// TruncateReadSegments makes WAL truncation remove every segment all remote
 	// write queues have read, instead of the lower two-thirds. When MaxWALTime
-	// caps the truncation point, the two-thirds rule still applies.
+	// caps the truncation point, it removes the lower two-thirds instead if
+	// that reaches further, read or not.
 	TruncateReadSegments bool
 
 	// NoLockfile disables creation and consideration of a lock file.
@@ -145,7 +146,15 @@ type dbMetrics struct {
 	checkpointDeleteTotal       prometheus.Counter
 	checkpointCreationFail      prometheus.Counter
 	checkpointCreationTotal     prometheus.Counter
+	truncationsTotal            *prometheus.CounterVec
 }
+
+// Values of the rule label on prometheus_agent_wal_truncations_total.
+const (
+	truncateRuleTwoThirds    = "two_thirds"
+	truncateRuleReadSegments = "read_segments"
+	truncateRuleCapped       = "capped"
+)
 
 func newDBMetrics(r prometheus.Registerer) *dbMetrics {
 	m := dbMetrics{r: r}
@@ -209,6 +218,14 @@ func newDBMetrics(r prometheus.Registerer) *dbMetrics {
 		Help: "Total number of checkpoint creations attempted.",
 	})
 
+	m.truncationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "prometheus_agent_wal_truncations_total",
+		Help: "Total number of WAL truncations by the rule that picked the segments: two_thirds, read_segments, or capped when max-time forced removing segments not yet read by remote write.",
+	}, []string{"rule"})
+	for _, rule := range []string{truncateRuleTwoThirds, truncateRuleReadSegments, truncateRuleCapped} {
+		m.truncationsTotal.WithLabelValues(rule)
+	}
+
 	if r != nil {
 		r.MustRegister(
 			m.numActiveSeries,
@@ -223,6 +240,7 @@ func newDBMetrics(r prometheus.Registerer) *dbMetrics {
 			m.checkpointDeleteTotal,
 			m.checkpointCreationFail,
 			m.checkpointCreationTotal,
+			m.truncationsTotal,
 		)
 	}
 
@@ -246,6 +264,7 @@ func (m *dbMetrics) Unregister() {
 		m.checkpointDeleteTotal,
 		m.checkpointCreationFail,
 		m.checkpointCreationTotal,
+		m.truncationsTotal,
 	}
 	for _, c := range cs {
 		m.r.Unregister(c)
@@ -704,31 +723,37 @@ Loop:
 		case <-db.stopc:
 			break Loop
 		case <-time.After(db.opts.TruncateFrequency):
-			// The timestamp ts is used to determine which series are not receiving
-			// samples and may be deleted from the WAL. Their most recent append
-			// timestamp is compared to ts, and if that timestamp is older then ts,
-			// they are considered inactive and may be deleted.
-			//
-			// Subtracting a duration from ts will add a buffer for when series are
-			// considered inactive and safe for deletion.
-			ts := max(db.rs.LowestSentTimestamp()-db.opts.MinWALTime, 0)
-
-			// Network issues can prevent the result of getRemoteWriteTimestamp from
-			// changing. We don't want data in the WAL to grow forever, so we set a cap
-			// on the maximum age data can be. If our ts is older than this cutoff point,
-			// we'll shift it forward to start deleting very stale data.
-			capped := false
-			if maxTS := timestamp.FromTime(time.Now()) - db.opts.MaxWALTime; ts < maxTS {
-				ts = maxTS
-				capped = true
-			}
-
-			db.logger.Debug("truncating the WAL", "ts", ts)
+			ts, capped := db.truncationPoint(timestamp.FromTime(time.Now()), db.rs.LowestSentTimestamp())
+			db.logger.Debug("truncating the WAL", "ts", ts, "capped", capped)
 			if err := db.truncateAt(ts, capped); err != nil {
 				db.logger.Warn("failed to truncate WAL", "err", err)
 			}
 		}
 	}
+}
+
+// truncationPoint returns the timestamp to truncate at, and whether the
+// max-time cap set it.
+func (db *DB) truncationPoint(now, lowestSent int64) (ts int64, capped bool) {
+	// The timestamp ts is used to determine which series are not receiving
+	// samples and may be deleted from the WAL. Their most recent append
+	// timestamp is compared to ts, and if that timestamp is older then ts,
+	// they are considered inactive and may be deleted.
+	//
+	// Subtracting a duration from ts will add a buffer for when series are
+	// considered inactive and safe for deletion.
+	ts = max(lowestSent-db.opts.MinWALTime, 0)
+
+	// Network issues can prevent the result of getRemoteWriteTimestamp from
+	// changing. We don't want data in the WAL to grow forever, so we set a cap
+	// on the maximum age data can be. If our ts is older than this cutoff point,
+	// we'll shift it forward to start deleting very stale data.
+	// A queue that never sent anything reports 0 and caps every truncation;
+	// truncateAt only acts on that when it would remove more than was read.
+	if maxTS := now - db.opts.MaxWALTime; ts < maxTS {
+		return maxTS, true
+	}
+	return ts, false
 }
 
 // keepSeriesInWALCheckpointFn returns a function that is used to determine whether a series record should be kept in the checkpoint.
@@ -753,8 +778,8 @@ func (db *DB) truncate(mint int64) error {
 
 // truncateAt GCs series older than mint and truncates the WAL. With
 // TruncateReadSegments, it removes every segment all remote write queues have
-// read, unless the max-time cap set mint (unreadAllowed), which falls back to
-// the lower two-thirds whether read or not.
+// read. If the max-time cap set mint (unreadAllowed), it removes the lower
+// two-thirds instead when that reaches further, read or not.
 func (db *DB) truncateAt(mint int64, unreadAllowed bool) error {
 	db.logger.Info("series GC started")
 	db.mtx.RLock()
@@ -781,21 +806,31 @@ func (db *DB) truncateAt(mint int64, unreadAllowed bool) error {
 		return nil // no segments yet
 	}
 
-	if db.opts.TruncateReadSegments && !unreadAllowed {
+	// The lower two-thirds of segments should contain mostly obsolete samples.
+	// If we have less than two segments, it's not worth checkpointing yet.
+	twoThirds := first + (last-first)*2/3
+	if twoThirds <= first {
+		twoThirds = first - 1
+	}
+	rule := truncateRuleTwoThirds
+	if db.opts.TruncateReadSegments {
 		// Every queue has read these segments, so nothing in them is still to be sent.
-		last = min(last, db.lowestReadSegment())
-		if last < first {
-			return nil
+		readSegments := min(last, db.lowestReadSegment())
+		rule = truncateRuleReadSegments
+		// Under the max-time cap, the two-thirds rule may also remove unread segments.
+		if unreadAllowed && twoThirds > readSegments {
+			readSegments = twoThirds
+			rule = truncateRuleCapped
 		}
+		last = readSegments
 	} else {
-		// The lower two-thirds of segments should contain mostly obsolete samples.
-		// If we have less than two segments, it's not worth checkpointing yet.
-		last = first + (last-first)*2/3
-		if last <= first {
-			return nil
-		}
+		last = twoThirds
+	}
+	if last < first {
+		return nil
 	}
 
+	db.metrics.truncationsTotal.WithLabelValues(rule).Inc()
 	db.metrics.checkpointCreationTotal.Inc()
 
 	if db.opts.CheckpointFromInMemorySeries {
@@ -842,7 +877,7 @@ func (db *DB) truncateAt(mint int64, unreadAllowed bool) error {
 
 	db.metrics.walTruncateDuration.Observe(time.Since(start).Seconds())
 
-	db.logger.Info("WAL checkpoint complete", "first", first, "last", last, "duration", time.Since(start))
+	db.logger.Info("WAL checkpoint complete", "first", first, "last", last, "rule", rule, "duration", time.Since(start))
 	return nil
 }
 

@@ -584,7 +584,7 @@ func main() {
 		Default(agentDefaultMaxWALTime).SetValue(&cfg.agent.MaxWALTime)
 
 	agentOnlyFlag(a, "storage.agent.truncate-read-segments",
-		"On WAL truncation, remove every segment all remote write queues have read, instead of the lower two-thirds. When --storage.agent.retention.max-time caps truncation, the two-thirds rule still applies.").
+		"On WAL truncation, remove every segment all remote write queues have read, instead of the lower two-thirds. When --storage.agent.retention.max-time caps truncation, it removes the lower two-thirds instead if that reaches further, read or not.").
 		Default("false").BoolVar(&cfg.agent.TruncateReadSegments)
 
 	agentOnlyFlag(a, "storage.agent.checkpoint-from-in-memory-series", "Use only in-memory series data when building a checkpoint.").

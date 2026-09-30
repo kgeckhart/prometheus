@@ -444,6 +444,18 @@ func TestWatcher_LastReadSegment(t *testing.T) {
 	require.Len(t, wt.samplesAppended, 1)
 }
 
+func TestWatcher_LastReadSegmentResetOnRetry(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.Mkdir(path.Join(dir, "wal"), 0o777))
+
+	watcher := NewWatcher(wMetrics, nil, nil, "", newWriteToMock(0), dir, false, false, false, nil)
+	watcher.lastReadSegment.Store(5)
+
+	// A retried Run starts over from the checkpoint. With no segments it fails before reading any.
+	require.Error(t, watcher.Run())
+	require.Equal(t, -1, watcher.LastReadSegment())
+}
+
 func TestReadToEndWithCheckpoint(t *testing.T) {
 	segmentSize := 32 * 1024
 	// We need something similar to this # of series and samples

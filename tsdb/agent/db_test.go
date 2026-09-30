@@ -27,6 +27,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/prometheus/client_golang/prometheus"
+	prom_testutil "github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/promslog"
@@ -35,6 +36,7 @@ import (
 	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/storage/remote"
 	"github.com/prometheus/prometheus/tsdb"
@@ -1532,16 +1534,20 @@ func TestTruncateReadSegments(t *testing.T) {
 		closed        int // Closed segments before truncation, plus the one truncate closes.
 		lowestRead    int
 		unreadAllowed bool
-		wantFirst     int // First segment left after truncation.
+		wantFirst     int    // First segment left after truncation.
+		wantRule      string // Rule counted, or empty if nothing was truncated.
 	}{
-		{name: "off, two-thirds rule", closed: 3, lowestRead: -1, wantFirst: 2},
+		{name: "off, two-thirds rule", closed: 3, lowestRead: -1, wantFirst: 2, wantRule: truncateRuleTwoThirds},
 		{name: "off, two closed segments truncate nothing", closed: 2, lowestRead: -1, wantFirst: 0},
-		{name: "healthy reader removes everything read", enabled: true, closed: 3, lowestRead: 2, wantFirst: 3},
-		{name: "healthy reader with two closed segments", enabled: true, closed: 2, lowestRead: 1, wantFirst: 2},
-		{name: "no queues", enabled: true, closed: 3, lowestRead: math.MaxInt, wantFirst: 3},
-		{name: "lagging reader keeps what the two-thirds rule would cut", enabled: true, closed: 3, lowestRead: 0, wantFirst: 1},
+		{name: "healthy reader removes everything read", enabled: true, closed: 3, lowestRead: 2, wantFirst: 3, wantRule: truncateRuleReadSegments},
+		{name: "healthy reader with two closed segments", enabled: true, closed: 2, lowestRead: 1, wantFirst: 2, wantRule: truncateRuleReadSegments},
+		{name: "no queues", enabled: true, closed: 3, lowestRead: math.MaxInt, wantFirst: 3, wantRule: truncateRuleReadSegments},
+		{name: "lagging reader keeps what the two-thirds rule would cut", enabled: true, closed: 3, lowestRead: 0, wantFirst: 1, wantRule: truncateRuleReadSegments},
 		{name: "reader still on the checkpoint", enabled: true, closed: 3, lowestRead: -1, wantFirst: 0},
-		{name: "max-time cap truncates unread segments", enabled: true, closed: 3, lowestRead: -1, unreadAllowed: true, wantFirst: 2},
+		{name: "max-time cap truncates unread segments", enabled: true, closed: 3, lowestRead: -1, unreadAllowed: true, wantFirst: 2, wantRule: truncateRuleCapped},
+		{name: "max-time cap past a lagging reader", enabled: true, closed: 3, lowestRead: 0, unreadAllowed: true, wantFirst: 2, wantRule: truncateRuleCapped},
+		// A queue that never sent caps every truncation, but a healthy reader still wins.
+		{name: "max-time cap with a healthy reader", enabled: true, closed: 3, lowestRead: 2, unreadAllowed: true, wantFirst: 3, wantRule: truncateRuleReadSegments},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1565,8 +1571,48 @@ func TestTruncateReadSegments(t *testing.T) {
 			first, _, err := wlog.Segments(db.wal.Dir())
 			require.NoError(t, err)
 			require.Equal(t, tc.wantFirst, first)
+			for _, rule := range []string{truncateRuleTwoThirds, truncateRuleReadSegments, truncateRuleCapped} {
+				want := 0.0
+				if rule == tc.wantRule {
+					want = 1
+				}
+				require.Equal(t, want, prom_testutil.ToFloat64(db.metrics.truncationsTotal.WithLabelValues(rule)), rule)
+			}
 		})
 	}
+}
+
+func TestTruncationPoint(t *testing.T) {
+	opts := DefaultOptions()
+	db := createTestAgentDB(t, nil, opts)
+	defer func() { require.NoError(t, db.Close()) }()
+
+	now := timestamp.FromTime(time.Now())
+	for _, tc := range []struct {
+		name       string
+		lowestSent int64
+		wantTS     int64
+		wantCapped bool
+	}{
+		{name: "healthy", lowestSent: now, wantTS: now - opts.MinWALTime},
+		{name: "queue never sent", lowestSent: 0, wantTS: now - opts.MaxWALTime, wantCapped: true},
+		{name: "outage past max-time", lowestSent: now - opts.MaxWALTime, wantTS: now - opts.MaxWALTime, wantCapped: true},
+		{name: "outage within max-time", lowestSent: now - opts.MaxWALTime + opts.MinWALTime, wantTS: now - opts.MaxWALTime},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, capped := db.truncationPoint(now, tc.lowestSent)
+			require.Equal(t, tc.wantTS, ts)
+			require.Equal(t, tc.wantCapped, capped)
+		})
+	}
+}
+
+func TestOpen_LowestReadSegmentFromRemoteStorage(t *testing.T) {
+	db := createTestAgentDB(t, nil, DefaultOptions())
+	defer func() { require.NoError(t, db.Close()) }()
+	// With no remote write queues, remote storage leaves truncation unconstrained.
+	require.Equal(t, math.MaxInt, db.lowestReadSegment())
+	require.Equal(t, db.rs.LowestReadSegment(), db.lowestReadSegment())
 }
 
 func readWALSamples(t *testing.T, walDir string) []walSample {

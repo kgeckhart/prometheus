@@ -14,9 +14,11 @@
 package remote
 
 import (
+	"bytes"
 	"errors"
 	"math"
 	"net/url"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -213,11 +215,22 @@ func TestWriteStorage_LowestReadSegment(t *testing.T) {
 		require.NoError(t, s.ApplyConfig(conf))
 		require.Eventually(t, func() bool { return s.LowestReadSegment() == 2 }, 10*time.Second, 10*time.Millisecond)
 
-		// The added queue starts from the checkpoint and catches up.
+		// The added queue starts from the checkpoint. Break the checkpoint so it
+		// can't get past it; the running queue has already read it and doesn't again.
+		cpFile := filepath.Join(dir, "wal", "checkpoint.00000001", "00000000")
+		cp, err := os.ReadFile(cpFile)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(cpFile, bytes.Repeat([]byte{0xff}, len(cp)), 0o666))
+
 		conf.RemoteWriteConfigs = append(conf.RemoteWriteConfigs, c2)
 		require.NoError(t, s.ApplyConfig(conf))
 		require.Len(t, s.queues, 2)
-		require.Eventually(t, func() bool { return s.LowestReadSegment() == 2 }, 10*time.Second, 10*time.Millisecond)
+		// The new queue holds the minimum at -1 until it has read the checkpoint.
+		require.Never(t, func() bool { return s.LowestReadSegment() != -1 }, time.Second, 10*time.Millisecond)
+
+		// Once the checkpoint reads, the watcher's retry catches up.
+		require.NoError(t, os.WriteFile(cpFile, cp, 0o666))
+		require.Eventually(t, func() bool { return s.LowestReadSegment() == 2 }, 15*time.Second, 10*time.Millisecond)
 	})
 }
 
