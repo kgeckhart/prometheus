@@ -27,6 +27,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/promslog"
+	"go.uber.org/atomic"
 
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/timestamp"
@@ -113,6 +114,9 @@ type Watcher struct {
 	readNotify chan struct{}
 	quit       chan struct{}
 	done       chan struct{}
+
+	// lastReadSegment is the highest segment fully read and handed to the writer, or -1.
+	lastReadSegment atomic.Int64
 
 	// For testing, stop when we hit this segment.
 	MaxSegment int
@@ -209,7 +213,7 @@ func NewWatcher(
 	if recordBuf == nil {
 		recordBuf = record.NewBuffersPool()
 	}
-	return &Watcher{
+	w := &Watcher{
 		logger:         logger,
 		recordBuf:      recordBuf,
 		writer:         writer,
@@ -227,6 +231,15 @@ func NewWatcher(
 
 		MaxSegment: -1,
 	}
+	w.lastReadSegment.Store(-1)
+	return w
+}
+
+// LastReadSegment returns the highest WAL segment the watcher has read to the
+// end and handed to its WriteTo, or -1 if there is none yet. Segments at or
+// below it are no longer needed by this watcher.
+func (w *Watcher) LastReadSegment() int {
+	return int(w.lastReadSegment.Load())
 }
 
 func (w *Watcher) Notify() {
@@ -299,6 +312,9 @@ func (w *Watcher) loop() {
 // Run the watcher, which will tail the WAL until the quit channel is closed
 // or an error case is hit.
 func (w *Watcher) Run() error {
+	// A retried Run starts over from the checkpoint.
+	w.lastReadSegment.Store(-1)
+
 	_, lastSegment, err := Segments(w.walDir)
 	if err != nil {
 		return fmt.Errorf("Segments: %w", err)
@@ -327,6 +343,8 @@ func (w *Watcher) Run() error {
 	if err != nil {
 		return err
 	}
+	// Anything older is either in the checkpoint just read or already gone.
+	w.lastReadSegment.Store(int64(currentSegment - 1))
 
 	w.logger.Debug("Tailing WAL", "lastCheckpoint", lastCheckpoint, "checkpointIndex", checkpointIndex, "currentSegment", currentSegment, "lastSegment", lastSegment)
 	for !isClosed(w.quit) {
@@ -337,6 +355,10 @@ func (w *Watcher) Run() error {
 		w.logger.Debug("Processing segment", "currentSegment", currentSegment)
 		if err := w.watch(currentSegment, currentSegment < lastSegment); err != nil && !errors.Is(err, ErrIgnorable) {
 			return err
+		}
+		// watch returns early only on quit. Otherwise the segment was read to the end.
+		if !isClosed(w.quit) {
+			w.lastReadSegment.Store(int64(currentSegment))
 		}
 
 		// For testing: stop when you hit a specific segment.

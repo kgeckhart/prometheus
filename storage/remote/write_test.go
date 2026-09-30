@@ -15,7 +15,9 @@ package remote
 
 import (
 	"errors"
+	"math"
 	"net/url"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -24,6 +26,7 @@ import (
 	prom_testutil "github.com/prometheus/client_golang/prometheus/testutil"
 	common_config "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/common/promslog"
 	"github.com/stretchr/testify/require"
 
 	"github.com/prometheus/prometheus/config"
@@ -31,6 +34,10 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/chunks"
+	"github.com/prometheus/prometheus/tsdb/record"
+	"github.com/prometheus/prometheus/tsdb/wlog"
+	"github.com/prometheus/prometheus/util/compression"
 )
 
 func testRemoteWriteConfig() *config.RemoteWriteConfig {
@@ -146,6 +153,72 @@ func TestWriteStorageApplyConfig_RestartOnNameChange(t *testing.T) {
 	require.Equal(t, s.queues[hash].client().Name(), conf.RemoteWriteConfigs[0].Name)
 
 	require.NoError(t, s.Close())
+}
+
+func TestWriteStorage_LowestReadSegment(t *testing.T) {
+	// newWAL writes segments 0 to 3 with a checkpoint at 1, so watchers start at segment 2
+	// and tail segment 3.
+	newWAL := func(t *testing.T) string {
+		dir := t.TempDir()
+		w, err := wlog.NewSize(nil, nil, filepath.Join(dir, "wal"), 128*1024, compression.None)
+		require.NoError(t, err)
+		var enc record.Encoder
+		require.NoError(t, w.Log(enc.Series([]record.RefSeries{{Ref: 1, Labels: labels.FromStrings("__name__", "m")}}, nil)))
+		for range 3 {
+			_, err = w.NextSegment()
+			require.NoError(t, err)
+		}
+		_, err = wlog.Checkpoint(promslog.NewNopLogger(), w, 0, 1, func(chunks.HeadSeriesRef) bool { return true }, 0, false, false)
+		require.NoError(t, err)
+		require.NoError(t, w.Truncate(2))
+		require.NoError(t, w.Close())
+		return dir
+	}
+
+	t.Run("no queues", func(t *testing.T) {
+		s := NewWriteStorage(nil, nil, t.TempDir(), time.Millisecond, nil, false)
+		defer func() { require.NoError(t, s.Close()) }()
+		require.Equal(t, math.MaxInt, s.LowestReadSegment())
+	})
+
+	t.Run("min across queues", func(t *testing.T) {
+		dir := newWAL(t)
+		s := NewWriteStorage(nil, nil, dir, time.Millisecond, nil, false)
+		defer func() { require.NoError(t, s.Close()) }()
+		newQueue := func() *QueueManager {
+			return NewQueueManager(newQueueManagerMetrics(nil, "", ""), wlog.NewWatcherMetrics(nil), wlog.NewLiveReaderMetrics(nil), nil, dir, newEWMARate(ewmaWeight, shardUpdateDuration), config.DefaultQueueConfig, config.DefaultMetadataConfig, labels.EmptyLabels(), nil, NewTestWriteClient(remoteapi.WriteV1MessageType), time.Millisecond, newPool(), newHighestTimestampMetric(), nil, false, false, false, remoteapi.WriteV1MessageType, record.NewBuffersPool(), false)
+		}
+		running, idle := newQueue(), newQueue()
+		running.Start()
+		s.mtx.Lock()
+		s.queues = map[string]*QueueManager{"running": running, "idle": idle}
+		s.mtx.Unlock()
+
+		require.Eventually(t, func() bool { return running.watcher.LastReadSegment() == 2 }, 10*time.Second, 10*time.Millisecond)
+		// The queue that hasn't read anything holds everyone back.
+		require.Equal(t, -1, s.LowestReadSegment())
+
+		idle.Start()
+		require.Eventually(t, func() bool { return s.LowestReadSegment() == 2 }, 10*time.Second, 10*time.Millisecond)
+	})
+
+	t.Run("reload adds a queue", func(t *testing.T) {
+		dir := newWAL(t)
+		s := NewWriteStorage(nil, nil, dir, time.Millisecond, nil, false)
+		defer func() { require.NoError(t, s.Close()) }()
+
+		c1, c2 := testRemoteWriteConfig(), testRemoteWriteConfig()
+		c2.Name = "second"
+		conf := &config.Config{GlobalConfig: config.DefaultGlobalConfig, RemoteWriteConfigs: []*config.RemoteWriteConfig{c1}}
+		require.NoError(t, s.ApplyConfig(conf))
+		require.Eventually(t, func() bool { return s.LowestReadSegment() == 2 }, 10*time.Second, 10*time.Millisecond)
+
+		// The added queue starts from the checkpoint and catches up.
+		conf.RemoteWriteConfigs = append(conf.RemoteWriteConfigs, c2)
+		require.NoError(t, s.ApplyConfig(conf))
+		require.Len(t, s.queues, 2)
+		require.Eventually(t, func() bool { return s.LowestReadSegment() == 2 }, 10*time.Second, 10*time.Millisecond)
+	})
 }
 
 func TestWriteStorageApplyConfig_UpdateWithRegisterer(t *testing.T) {

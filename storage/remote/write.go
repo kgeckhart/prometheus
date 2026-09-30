@@ -281,6 +281,20 @@ func (rws *WriteStorage) LowestSentTimestamp() int64 {
 	return lowestTs
 }
 
+// LowestReadSegment returns the highest WAL segment that every queue has read
+// to the end, or math.MaxInt if there are no queues. It is -1 while a queue
+// hasn't finished reading its checkpoint.
+func (rws *WriteStorage) LowestReadSegment() int {
+	rws.mtx.Lock()
+	defer rws.mtx.Unlock()
+
+	lowest := math.MaxInt
+	for _, q := range rws.queues {
+		lowest = min(lowest, q.watcher.LastReadSegment())
+	}
+	return lowest
+}
+
 // Close closes the WriteStorage.
 func (rws *WriteStorage) Close() error {
 	rws.mtx.Lock()

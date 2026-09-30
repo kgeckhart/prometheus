@@ -205,6 +205,12 @@ func (s *Storage) LowestSentTimestamp() int64 {
 	return s.rws.LowestSentTimestamp()
 }
 
+// LowestReadSegment returns the highest WAL segment every queue has read to the end.
+// See WriteStorage.LowestReadSegment.
+func (s *Storage) LowestReadSegment() int {
+	return s.rws.LowestReadSegment()
+}
+
 // Close the background processing of the storage queues.
 func (s *Storage) Close() error {
 	s.deduper.Stop()

@@ -404,6 +404,46 @@ func TestReadToEndNoCheckpoint(t *testing.T) {
 	}
 }
 
+func TestWatcher_LastReadSegment(t *testing.T) {
+	dir := t.TempDir()
+	wdir := path.Join(dir, "wal")
+	require.NoError(t, os.Mkdir(wdir, 0o777))
+
+	w, err := NewSize(nil, nil, wdir, 128*1024, compression.None)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, w.Close())
+	}()
+
+	var enc record.Encoder
+	ts := timestamp.FromTime(time.Now().Add(time.Hour))
+	require.NoError(t, w.Log(enc.Series([]record.RefSeries{{Ref: 1, Labels: labels.FromStrings("__name__", "m")}}, nil)))
+	// Segments 0 and 1 are read in onlySeries mode, segment 2 is tailed.
+	for range 2 {
+		_, err = w.NextSegment()
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Log(enc.Samples([]record.RefSample{{Ref: 1, T: ts, V: 1}}, nil)))
+
+	overwriteReadTimeout(t, time.Second)
+	wt := newWriteToMock(0)
+	watcher := NewWatcher(wMetrics, nil, nil, "", wt, dir, false, false, false, nil)
+	require.Equal(t, -1, watcher.LastReadSegment())
+	go watcher.Start()
+	defer watcher.Stop()
+
+	require.Eventually(t, func() bool { return watcher.LastReadSegment() == 1 }, 10*time.Second, 10*time.Millisecond)
+	require.Never(t, func() bool { return watcher.LastReadSegment() > 1 }, 500*time.Millisecond, 10*time.Millisecond)
+
+	// Segment 2 counts as read once a newer segment exists and its samples went to the writer.
+	_, err = w.NextSegment()
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return watcher.LastReadSegment() == 2 }, 10*time.Second, 10*time.Millisecond)
+	wt.mu.Lock()
+	defer wt.mu.Unlock()
+	require.Len(t, wt.samplesAppended, 1)
+}
+
 func TestReadToEndWithCheckpoint(t *testing.T) {
 	segmentSize := 32 * 1024
 	// We need something similar to this # of series and samples
