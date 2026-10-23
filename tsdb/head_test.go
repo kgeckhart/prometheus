@@ -38,6 +38,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	prom_testutil "github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/promslog"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
@@ -963,9 +964,8 @@ func TestHead_ReadWAL(t *testing.T) {
 				require.NotEmpty(t, e[0].Exemplars)
 				require.True(t, exemplar.Exemplar{Ts: 101, Value: 7, Labels: labels.FromStrings("trace_id", "zxcv")}.Equals(e[0].Exemplars[0]))
 
-				require.False(t, metadata.IsZeroHandle(s100.meta))
-				require.Equal(t, "foo", s100.meta.Value().Unit)
-				require.Equal(t, "total foo", s100.meta.Value().Help)
+				// Unlike samples, tombstones and exemplars, the duplicate's metadata isn't remapped onto ref 100.
+				require.True(t, metadata.IsZeroHandle(s100.meta))
 
 				intervals, err := head.tombstones.Get(storage.SeriesRef(s100.ref))
 				require.NoError(t, err)
@@ -1033,6 +1033,67 @@ func TestHead_WALMultiRef(t *testing.T) {
 		sample{0, 1700, 3, nil, nil},
 		sample{0, 2000, 4, nil, nil},
 	}}, series)
+}
+
+func TestHead_WALMultiRef_MetadataNotRemapped(t *testing.T) {
+	lbls := labels.FromStrings("foo", "bar")
+	oldMeta := metadata.Metadata{Type: model.MetricTypeCounter, Help: "old"}
+	newMeta := metadata.Metadata{Type: model.MetricTypeCounter, Help: "new"}
+
+	for name, appendWithMeta := range map[string]func(t *testing.T, h *Head) storage.SeriesRef{
+		"appender v1": func(t *testing.T, h *Head) storage.SeriesRef {
+			app := h.Appender(context.Background())
+			ref, err := app.Append(0, lbls, 300, 3)
+			require.NoError(t, err)
+			_, err = app.UpdateMetadata(ref, lbls, newMeta)
+			require.NoError(t, err)
+			require.NoError(t, app.Commit())
+			return ref
+		},
+		"appender v2": func(t *testing.T, h *Head) storage.SeriesRef {
+			app := h.AppenderV2(context.Background())
+			ref, err := app.Append(0, lbls, 0, 300, 3, nil, nil, storage.AOptions{Metadata: newMeta})
+			require.NoError(t, err)
+			require.NoError(t, app.Commit())
+			return ref
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			opts := newTestHeadDefaultOptions(1000, false)
+			opts.EnableMetadataWALRecords = true
+			head, w := newTestHeadWithOptions(t, compression.None, opts)
+
+			// The same series was GC'd as ref 5 and came back as ref 10.
+			populateTestWL(t, w, []any{
+				[]record.RefSeries{{Ref: 5, Labels: lbls}},
+				[]record.RefMetadata{{Ref: 5, Type: uint8(record.Counter), Help: oldMeta.Help}},
+				[]record.RefSample{{Ref: 5, T: 100, V: 1}},
+				[]record.RefSeries{{Ref: 10, Labels: lbls}},
+				[]record.RefMetadata{{Ref: 10, Type: uint8(record.Counter), Help: newMeta.Help}},
+				[]record.RefSample{{Ref: 10, T: 200, V: 2}},
+			}, nil, false)
+			require.NoError(t, head.Init(0))
+
+			// Remote write keys metadata by WAL ref, so replay must not carry ref 10's metadata over to ref 5.
+			require.Equal(t, oldMeta, head.series.getByID(5).meta.Value())
+
+			ref := appendWithMeta(t, head)
+			require.Equal(t, storage.SeriesRef(5), ref)
+			require.NoError(t, head.Close())
+
+			var got []record.RefMetadata
+			for _, rec := range readTestWAL(t, w.Dir()) {
+				if m, ok := rec.([]record.RefMetadata); ok {
+					got = append(got, m...)
+				}
+			}
+			require.Equal(t, []record.RefMetadata{
+				{Ref: 5, Type: uint8(record.Counter), Help: oldMeta.Help},
+				{Ref: 10, Type: uint8(record.Counter), Help: newMeta.Help},
+				{Ref: 5, Type: uint8(record.Counter), Help: newMeta.Help},
+			}, got)
+		})
+	}
 }
 
 // TestHead_WALMultiRef_StaleDeletion_ChunkGaugeNotNegative is a regression test

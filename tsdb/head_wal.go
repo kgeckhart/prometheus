@@ -461,8 +461,9 @@ Outer:
 			h.wlReplayFloatHistogramsPool.Put(v[:0])
 		case []record.RefMetadata:
 			for _, m := range v {
-				if r, ok := multiRef[m.Ref]; ok {
-					m.Ref = r
+				// Keep in-memory metadata equal to the latest WAL record for this ref, so append dedup doesn't skip logging a change.
+				if _, ok := multiRef[m.Ref]; ok {
+					continue
 				}
 				s := h.series.getByID(m.Ref)
 				if s == nil {

@@ -1064,18 +1064,12 @@ func TestDuplicateSeriesRefsByHash(t *testing.T) {
 			t.Cleanup(func() { require.NoError(t, rs2.Close()) })
 			db, err = Open(promslog.NewNopLogger(), nil, rs2, dbDir, opts)
 			require.NoError(t, err)
-			t.Cleanup(func() { require.NoError(t, db.Close()) })
 
-			// The original SeriesRefs should be in series with initialMeta (for i==0, recovered from
-			// the deleted series in the checkpoint) or updatedMeta (for i>0, remapped from duplicateSeriesRefs).
-			for i, ref := range originalSeriesRefs {
+			// Replay keeps each ref's own metadata instead of remapping the duplicates' onto it.
+			for _, ref := range originalSeriesRefs {
 				s := db.series.GetByID(ref)
 				require.NotNil(t, s)
-				if i == 0 {
-					require.Equal(t, initialMeta, s.Metadata().Value())
-				} else {
-					require.Equal(t, updatedMeta, s.Metadata().Value())
-				}
+				require.Equal(t, initialMeta, s.Metadata().Value())
 				require.NotContains(t, db.deleted, ref)
 			}
 
@@ -1086,6 +1080,39 @@ func TestDuplicateSeriesRefsByHash(t *testing.T) {
 				if inMemCheckpoint && i > 0 {
 					require.Equal(t, updatedMeta, db.deleted[ref].meta.Value())
 				}
+			}
+
+			// Appends after replay land on the original SeriesRefs and log their metadata change.
+			app = db.AppenderV2(context.Background())
+			for i, metricName := range metricNames {
+				lbls := labels.FromMap(map[string]string{"__name__": metricName})
+				var aopts storage.AOptions
+				if i > 0 {
+					aopts.Metadata = updatedMeta
+				}
+				ref, err := app.Append(storage.SeriesRef(0), lbls, 0, int64(30), 10.0, nil, nil, aopts)
+				require.NoError(t, err)
+				require.Equal(t, originalSeriesRefs[i], chunks.HeadSeriesRef(ref))
+			}
+			require.NoError(t, app.Commit())
+			walDir := db.wal.Dir()
+			require.NoError(t, db.Close())
+
+			latestMeta := map[chunks.HeadSeriesRef]record.RefMetadata{}
+			for _, rec := range readTestWAL(t, walDir) {
+				if ms, ok := rec.([]record.RefMetadata); ok {
+					for _, m := range ms {
+						latestMeta[m.Ref] = m
+					}
+				}
+			}
+			for _, ref := range originalSeriesRefs[1:] {
+				require.Equal(t, record.RefMetadata{
+					Ref:  ref,
+					Type: record.GetMetricType(updatedMeta.Type),
+					Unit: updatedMeta.Unit,
+					Help: updatedMeta.Help,
+				}, latestMeta[ref])
 			}
 		})
 	}

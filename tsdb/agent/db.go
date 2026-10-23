@@ -696,8 +696,7 @@ func (db *DB) loadWAL(r *wlog.Reader, duplicateRefToValidRef map[chunks.HeadSeri
 					Unit: entry.Unit,
 					Help: entry.Help,
 				})
-				origRef := entry.Ref
-				if ref, ok := duplicateRefToValidRef[entry.Ref]; ok {
+				if _, ok := duplicateRefToValidRef[entry.Ref]; ok {
 					if meta, ok := db.deleted[entry.Ref]; ok && meta.lastSegment <= currentSegmentOrCheckpoint {
 						meta.lastSegment = currentSegmentOrCheckpoint
 						if db.opts.CheckpointFromInMemorySeries {
@@ -705,20 +704,14 @@ func (db *DB) loadWAL(r *wlog.Reader, duplicateRefToValidRef map[chunks.HeadSeri
 						}
 						db.deleted[entry.Ref] = meta
 					}
-					entry.Ref = ref
+					// Keep in-memory metadata equal to the latest WAL record for this ref, so append dedup doesn't skip logging a change.
+					continue
 				}
 				series := db.series.GetByID(entry.Ref)
 				if series == nil {
 					nonExistentSeriesRefs.Inc()
 					continue
 				}
-				// NOTE: agent.Checkpoint writes activeSeries before deletedSeries, so an older
-				// deleted series (origRef < entry.Ref) can be replayed after a recreated active
-				// series and must not overwrite its metadata.
-				if origRef < entry.Ref && !metadata.IsZeroHandle(series.meta) {
-					continue
-				}
-
 				series.meta = m
 			}
 			clear(v) // Zero out to avoid retaining metadata strings.
